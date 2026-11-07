@@ -10,7 +10,9 @@ use App\Services\AffiliateService;
 use App\Services\CouponService;
 use App\Services\FeatureFlags;
 use App\Services\SubscriptionGrace;
+use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Testing\DatabaseTransactionsManager as TestTransactionsManager;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -75,7 +77,7 @@ class SubscriptionActivation
                 $this->callbacks = null;
             }
         }
-        if ($central->transactionLevel() !== 0 || $this->callbacks !== null) {
+        if (self::callerTransactionLevel($central) !== 0 || $this->callbacks !== null) {
             throw new LogicException('Independent subscription activation must own the central commit boundary.');
         }
 
@@ -169,7 +171,7 @@ class SubscriptionActivation
         if ($local !== $central && $local->getPdo() === $central->getPdo()) {
             throw new LogicException('Shared-PDO aliases require one coordinated Connection object.');
         }
-        if ($central->transactionLevel() !== 0 && $local->getPdo() !== $central->getPdo()) {
+        if (self::callerTransactionLevel($central) !== 0 && $local->getPdo() !== $central->getPdo()) {
             throw new LogicException('Reconciliation must own the central commit boundary.');
         }
 
@@ -239,6 +241,34 @@ class SubscriptionActivation
 
             return $result;
         });
+    }
+
+    /**
+     * Transactions a caller already holds open on the connection.
+     *
+     * RefreshDatabase and DatabaseTransactions wrap every transacted connection
+     * in one transaction for the whole test, and Laravel's test transaction
+     * manager treats that wrapper as the outermost level (after-commit callbacks
+     * run when the level returns to it). Count it the same way, so the wrapper is
+     * not mistaken for a caller's open transaction. Outside a test run that
+     * manager is never bound, and this is exactly transactionLevel().
+     */
+    private static function callerTransactionLevel(Connection $connection): int
+    {
+        $level = $connection->transactionLevel();
+        if ($level === 0 || ! app()->runningUnitTests() || ! app()->bound('db.transactions')) {
+            return $level;
+        }
+        $manager = app('db.transactions');
+        if (! $manager instanceof TestTransactionsManager) {
+            return $level;
+        }
+        // The wrappers are the pending records the manager excludes from callbacks.
+        $pending = $manager->getPendingTransactions();
+        $wrappers = $pending->take($pending->count() - $manager->callbackApplicableTransactions()->count());
+        $wrapped = $wrappers->contains(fn ($record): bool => $record->connection === $connection->getName() && $record->level === 1);
+
+        return $wrapped ? $level - 1 : $level;
     }
 
     /** Only identifiers, entitlement flags and database-normalized dates; no provider secrets or personal fields. */
