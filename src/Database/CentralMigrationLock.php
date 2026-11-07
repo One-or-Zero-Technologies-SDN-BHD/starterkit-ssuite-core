@@ -15,23 +15,35 @@ use RuntimeException;
  * loser fails mid-deploy. A MySQL named lock, scoped to the central database's
  * name, makes the second app wait until the first has finished.
  *
- * The lock is session-scoped: MySQL releases it automatically if the migrating
- * process dies, so a crashed deploy never leaves it stuck.
+ * The lock lives on a dedicated connection, so purging or reconnecting the
+ * central connection during migrations cannot strand it, and it is tracked per
+ * PHP process, so a second application instance in the same process (as in a
+ * test suite) re-enters it instead of waiting on itself. MySQL releases the lock
+ * automatically if the migrating process dies.
  */
 class CentralMigrationLock
 {
-    private ?string $heldName = null;
+    private const LOCK_CONNECTION = 'ssuite_central_migration_lock';
+
+    private static ?string $heldName = null;
+
+    private static int $depth = 0;
 
     public function __construct(private DatabaseManager $databases) {}
 
     public function acquire(): void
     {
-        if ($this->heldName !== null || ! $this->isEnabled()) {
+        if (self::$heldName !== null) {
+            self::$depth++;
+
+            return;
+        }
+        if (! $this->isEnabled()) {
             return;
         }
 
-        $connection = $this->connection();
-        if ($connection === null || ! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+        $connection = $this->lockConnection();
+        if ($connection === null) {
             return;
         }
 
@@ -40,6 +52,8 @@ class CentralMigrationLock
         $result = $connection->selectOne('SELECT GET_LOCK(?, ?) AS acquired', [$name, $timeout]);
 
         if ((int) ($result->acquired ?? 0) !== 1) {
+            $this->databases->purge(self::LOCK_CONNECTION);
+
             throw new RuntimeException(sprintf(
                 'Waited %d seconds for the "%s" lock: another app is still migrating the shared central database. Re-run the deploy once it has finished.',
                 $timeout,
@@ -47,23 +61,33 @@ class CentralMigrationLock
             ));
         }
 
-        $this->heldName = $name;
+        self::$heldName = $name;
+        self::$depth = 1;
     }
 
     public function release(): void
     {
-        if ($this->heldName === null) {
+        if (self::$heldName === null) {
+            return;
+        }
+        if (--self::$depth > 0) {
             return;
         }
 
-        $name = $this->heldName;
-        $this->heldName = null;
-        $this->connection()?->selectOne('SELECT RELEASE_LOCK(?) AS released', [$name]);
+        $name = self::$heldName;
+        self::$heldName = null;
+        self::$depth = 0;
+
+        try {
+            $this->databases->connection(self::LOCK_CONNECTION)->selectOne('SELECT RELEASE_LOCK(?) AS released', [$name]);
+        } finally {
+            $this->databases->purge(self::LOCK_CONNECTION);
+        }
     }
 
     public function isHeld(): bool
     {
-        return $this->heldName !== null;
+        return self::$heldName !== null;
     }
 
     public function lockName(Connection $connection): string
@@ -76,14 +100,21 @@ class CentralMigrationLock
         return (bool) config('ssuite-core.central_migration_lock.enabled', true);
     }
 
-    private function connection(): ?Connection
+    /**
+     * A private copy of the central connection, used only for the lock.
+     */
+    private function lockConnection(): ?Connection
     {
         $name = (string) config('ssuite-core.central_migration_lock.connection', 'central');
+        $settings = config("database.connections.{$name}");
 
-        if (config("database.connections.{$name}") === null) {
+        if (! is_array($settings) || ! in_array($settings['driver'] ?? null, ['mysql', 'mariadb'], true)) {
             return null;
         }
 
-        return $this->databases->connection($name);
+        config(['database.connections.'.self::LOCK_CONNECTION => $settings]);
+        $this->databases->purge(self::LOCK_CONNECTION);
+
+        return $this->databases->connection(self::LOCK_CONNECTION);
     }
 }
