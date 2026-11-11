@@ -15,6 +15,7 @@ use App\Services\AffiliateService;
 use App\Services\CouponService;
 use App\Services\FeatureFlags;
 use App\Services\SubscriptionGrace;
+use App\Support\Billing\AddonSettlement;
 use App\Support\Billing\Currency;
 use App\Support\Billing\LockedPrice;
 use App\Support\Billing\PlanChange;
@@ -534,68 +535,59 @@ class SubscriptionService
             return;
         }
 
-        // Claim the payment and grant the add-on in ONE unit: the app-DB write
-        // runs inside the central transaction (as activate() does for plans),
-        // so a failure rolls the claim back and a gateway retry can finish it.
-        $addon = DB::connection('central')->transaction(function () use ($transaction, $gatewayResponse, $type, $item) {
-            $claimed = PaymentTransaction::whereKey($transaction->getKey())
-                ->where('status', '!=', 'success')
-                ->update(['status' => 'success', 'paid_at' => now()]) > 0;
+        $addon = AddonSettlement::apply($transaction, $gatewayResponse, 'addon', function () use ($transaction, $type, $item): TenantAddon {
+            $addon = TenantAddon::query()
+                ->forTenant((int) $transaction->tenant_id)
+                ->where('addon_type', $type)
+                ->whereIn('status', [TenantAddon::STATUS_ACTIVE, TenantAddon::STATUS_REQUESTED])
+                ->lockForUpdate()
+                ->latest('id')
+                ->first();
 
-            if (! $claimed) {
-                return null;
+            // Recover the previous implementation's interrupted latest grant.
+            // New purchases retain a receipt for every payment, not only this ID.
+            if ($addon && (int) $addon->last_transaction_id === (int) $transaction->id) {
+                return $addon;
             }
 
-            $transaction->update(['gateway_response' => $gatewayResponse]);
+            // A permanent add-on (active, no end date) stays permanent.
+            $permanent = $addon?->isPermanent() ?? false;
+            $from = $addon?->ends_at?->isFuture() ? $addon->ends_at->copy() : now();
+            $waitsForSetup = $item['requires_setup'] && $addon?->status !== TenantAddon::STATUS_ACTIVE;
 
-            return DB::transaction(function () use ($transaction, $type, $item) {
-                $addon = TenantAddon::query()
-                    ->forTenant((int) $transaction->tenant_id)
-                    ->where('addon_type', $type)
-                    ->whereIn('status', [TenantAddon::STATUS_ACTIVE, TenantAddon::STATUS_REQUESTED])
-                    ->lockForUpdate()
-                    ->latest('id')
-                    ->first();
+            $attributes = [
+                'monthly_price' => $item['monthly_price'],
+                'setup_fee' => $item['setup_fee'],
+                'currency' => Currency::normalize($transaction->currency),
+                'ends_at' => $permanent ? null : $from->addMonthNoOverflow(),
+                'last_transaction_id' => $transaction->id,
+            ];
 
-                // A permanent add-on (active, no end date) stays permanent.
-                $permanent = $addon?->isPermanent() ?? false;
-                $from = $addon?->ends_at?->isFuture() ? $addon->ends_at->copy() : now();
-                $waitsForSetup = $item['requires_setup'] && $addon?->status !== TenantAddon::STATUS_ACTIVE;
-
-                $attributes = [
-                    'monthly_price' => $item['monthly_price'],
-                    'setup_fee' => $item['setup_fee'],
-                    'currency' => Currency::normalize($transaction->currency),
-                    'ends_at' => $permanent ? null : $from->addMonthNoOverflow(),
-                    'last_transaction_id' => $transaction->id,
+            if ($waitsForSetup) {
+                $attributes += [
+                    'status' => TenantAddon::STATUS_REQUESTED,
+                    'requested_by' => $addon?->requested_by ?? $transaction->user_id,
+                    'requested_at' => $addon?->requested_at ?? now(),
+                    'request_note' => $addon?->request_note ?? 'Paid online — awaiting setup',
                 ];
+            } elseif ($addon?->status !== TenantAddon::STATUS_ACTIVE) {
+                $attributes += [
+                    'status' => TenantAddon::STATUS_ACTIVE,
+                    'activated_by' => $transaction->user_id,
+                    'activated_at' => now(),
+                ];
+            }
 
-                if ($waitsForSetup) {
-                    $attributes += [
-                        'status' => TenantAddon::STATUS_REQUESTED,
-                        'requested_by' => $addon?->requested_by ?? $transaction->user_id,
-                        'requested_at' => $addon?->requested_at ?? now(),
-                        'request_note' => $addon?->request_note ?? 'Paid online — awaiting setup',
-                    ];
-                } elseif ($addon?->status !== TenantAddon::STATUS_ACTIVE) {
-                    $attributes += [
-                        'status' => TenantAddon::STATUS_ACTIVE,
-                        'activated_by' => $transaction->user_id,
-                        'activated_at' => now(),
-                    ];
-                }
+            if ($addon) {
+                $addon->update($attributes);
 
-                if ($addon) {
-                    $addon->update($attributes);
+                return $addon;
+            }
 
-                    return $addon;
-                }
-
-                return TenantAddon::create($attributes + [
-                    'tenant_id' => $transaction->tenant_id,
-                    'addon_type' => $type,
-                ]);
-            });
+            return TenantAddon::create($attributes + [
+                'tenant_id' => $transaction->tenant_id,
+                'addon_type' => $type,
+            ]);
         });
 
         if (! $addon) {

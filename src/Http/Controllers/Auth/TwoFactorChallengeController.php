@@ -5,6 +5,7 @@ namespace Ssuite\Core\Http\Controllers\Auth;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use PragmaRX\Google2FA\Google2FA;
+use Ssuite\Core\Support\Auth\RecoveryCodes;
 
 /**
  * Per-session 2FA challenge. After login, a user with 2FA enabled must pass this
@@ -43,11 +44,7 @@ class TwoFactorChallengeController extends Controller
         }
 
         // 2) Single-use recovery code (case-insensitive).
-        $match = collect($user->recoveryCodes())
-            ->first(fn ($c) => hash_equals(strtoupper($c), strtoupper($input)));
-
-        if ($match) {
-            $user->replaceRecoveryCode($match);
+        if (RecoveryCodes::consume($user, $input)) {
             $request->session()->put('two_factor_verified', true);
 
             return redirect()->intended(route('dashboard'))

@@ -10,8 +10,6 @@ use App\Models\Plan;
 use App\Models\Tenant;
 use App\Models\User;
 use App\Models\UserPlan;
-use App\Notifications\NewAccountCreated;
-use App\Notifications\WorkspaceInvited;
 use App\Services\WorkspaceSeatGuard;
 use App\Support\Team\TeamRoster;
 use Illuminate\Http\Request;
@@ -19,6 +17,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Spatie\Permission\Models\Role;
+use Ssuite\Core\Support\Team\InvitationDelivery;
 
 class TenantUserController extends Controller
 {
@@ -128,9 +127,12 @@ class TenantUserController extends Controller
      */
     public function store(Request $request, Tenant $tenant)
     {
-        return app(WorkspaceSeatGuard::class)->run(
+        $recipient = null;
+        $response = app(WorkspaceSeatGuard::class)->run(
             $tenant,
-            fn (Tenant $locked) => $this->storeWithinCapacity($request, $locked),
+            function (Tenant $locked) use ($request, &$recipient) {
+                return $this->storeWithinCapacity($request, $locked, $recipient);
+            },
             function (Tenant $tenant) {
                 $isOwner = $tenant->user_id === Auth::id();
                 $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
@@ -142,9 +144,19 @@ class TenantUserController extends Controller
                 }
             },
         );
+
+        // Email delivery happens after the capacity transaction, never before
+        // the membership and role have been saved.
+        if ($recipient && ! InvitationDelivery::send($recipient, $tenant)) {
+            session()->forget('success');
+
+            return $response->with('warning', __('The team invitation was saved, but the email could not be sent. Use Resend invite to try again.'));
+        }
+
+        return $response;
     }
 
-    private function storeWithinCapacity(Request $request, Tenant $tenant)
+    private function storeWithinCapacity(Request $request, Tenant $tenant, ?User &$recipient)
     {
         $request->validate([
             'email' => 'required|string|email|max:255',
@@ -187,17 +199,12 @@ class TenantUserController extends Controller
             setPermissionsTeamId($tenant->id);
             TeamRoster::for($tenant)->assignRole($existingUser, $targetRole);
 
-            // Notify existing user they've been added
-            try {
-                $existingUser->notifyNow(new WorkspaceInvited($tenant));
-            } catch (\Throwable $e) {
-                \Log::warning('Failed to send workspace invite email to '.$existingUser->email.': '.$e->getMessage());
-            }
-
             $this->logActivity('invited_existing_user_to_website', $existingUser, [
                 'tenant_id' => $tenant->id,
                 'description' => "Added existing user '{$existingUser->email}' to workspace {$tenant->name} with role {$targetRole}",
             ]);
+
+            $recipient = $existingUser;
 
             return redirect()->route('tenants.users.index', $tenant)
                 ->with('success', __('Welcome aboard! We found an existing account for :name (:email) and they\'ve been added to your workspace\'s team.', ['name' => $existingUser->name, 'email' => $existingUser->email]));
@@ -226,17 +233,6 @@ class TenantUserController extends Controller
             UserPlan::create(['user_id' => $user->id, 'plan_id' => $freePlan->id]);
         }
 
-        // Send notification with creds (assuming notification is available in scount)
-        // Check if notification class exists, otherwise skip or log
-        // Send credentials email immediately (not queued)
-        $emailSent = false;
-        try {
-            $user->notifyNow(new NewAccountCreated(['email' => $user->email, 'password' => $rawPassword]));
-            $emailSent = true;
-        } catch (\Throwable $e) {
-            \Log::warning('Failed to send invite email to '.$user->email.': '.$e->getMessage());
-        }
-
         TeamRoster::for($tenant)->attach($user->id, ['invited_at' => now()]);
 
         // Assign Role
@@ -248,13 +244,10 @@ class TenantUserController extends Controller
             'description' => "Added new user '{$user->name}' to workspace {$tenant->name} with role {$targetRole}",
         ]);
 
-        if ($emailSent) {
-            return redirect()->route('tenants.users.index', $tenant)
-                ->with('success', __('User :name (:email) has been invited. Login credentials have been emailed.', ['name' => $user->name, 'email' => $user->email]));
-        }
+        $recipient = $user;
 
         return redirect()->route('tenants.users.index', $tenant)
-            ->with('success', __('User :name created but email could not be sent. Temporary password: :password — please share it securely.', ['name' => $user->name, 'password' => $rawPassword]));
+            ->with('success', __('The team invitation was saved and a password setup link has been emailed.'));
     }
 
     public function edit(Tenant $tenant, User $user)
@@ -411,10 +404,8 @@ class TenantUserController extends Controller
             return back()->with('error', __(':name has already joined — there is no invite to resend.', ['name' => $user->name]));
         }
 
-        try {
-            $user->notifyNow(new WorkspaceInvited($tenant));
-        } catch (\Throwable $e) {
-            return back()->with('error', 'Failed to send invite email: '.$e->getMessage());
+        if (! InvitationDelivery::send($user, $tenant)) {
+            return back()->with('error', __('The invitation email could not be sent. Please try Resend invite again.'));
         }
 
         // Update invited_at
