@@ -142,6 +142,24 @@ class SubscriptionRenewalService
             return 'already_renewed';
         }
 
+        // Unknown/stale attempts can already own a real pending charge. Its
+        // amount and idempotency key belong to the recorded payment currency,
+        // not a subsequently changed app setting. Do not mutate that evidence
+        // or contact a gateway until an operator resolves the currency change.
+        $pendingPayment = $existing?->payment_transaction_id
+            ? PaymentTransaction::whereKey($existing->payment_transaction_id)->where('status', 'pending')->first()
+            : null;
+        if ($pendingPayment && Currency::normalize($pendingPayment->currency) !== Currency::code()) {
+            Log::warning('Auto-renewal held after billing currency changed', [
+                'subscription_id' => $subscription->id,
+                'payment_transaction_id' => $pendingPayment->id,
+                'payment_currency' => Currency::normalize($pendingPayment->currency),
+                'current_currency' => Currency::code(),
+            ]);
+
+            return 'skipped_currency_mismatch';
+        }
+
         // Online payments switched off: no charge, no attempt, no dunning. The
         // reminder ladder still tells the owner to renew (CheckSubscriptionExpiry).
         if (! OnlinePayments::enabled()) {
@@ -251,9 +269,16 @@ class SubscriptionRenewalService
         try {
             // After an unknown outcome, first find out what happened to that
             // charge (gateways keep idempotency keys only for a while).
-            $result = $existing?->status === 'unknown'
-                ? $this->resolveUnknown($gateway, $attempt, $reference)
-                : null;
+            // A worker can die while a charge is processing, before recording
+            // `unknown`; a previously linked pending payment also requires lookup.
+            $recovering = $existing?->status === 'unknown' || $pendingPayment !== null;
+            $result = $recovering ? $this->resolveUnknown($gateway, $attempt, $reference) : null;
+            if ($recovering && $result === null && strtolower($instrument->gateway) === 'stripe'
+                && $attempt->created_at && $attempt->created_at->lte(now()->subHours(24))) {
+                // Stripe search is eventually consistent, and keys may be removed
+                // after24h. An empty search cannot justify a fresh charge then.
+                throw new UnknownChargeOutcome('Stripe renewal requires reconciliation: the earlier charge was not found and its idempotency window has elapsed.');
+            }
 
             $result ??= $gateway->chargeInstrument((string) $instrument->token, $amount, $reference, $gatewayKey);
         } catch (\Throwable $e) {

@@ -156,7 +156,7 @@ class TenantUserController extends Controller
         return $response;
     }
 
-    private function storeWithinCapacity(Request $request, Tenant $tenant, ?User &$recipient)
+    protected function storeWithinCapacity(Request $request, Tenant $tenant, ?User &$recipient)
     {
         $request->validate([
             'email' => 'required|string|email|max:255',
@@ -419,7 +419,7 @@ class TenantUserController extends Controller
      *
      * @return list<array<string, mixed>>
      */
-    private function roleCards(TeamRoster $roster): array
+    protected function roleCards(TeamRoster $roster): array
     {
         $offered = app(TenantRoleController::class)->assignablePermissions($roster->tenant())->pluck('name')->all();
 

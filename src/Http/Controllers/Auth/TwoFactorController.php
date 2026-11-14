@@ -51,12 +51,12 @@ class TwoFactorController extends Controller
         $user = $request->user();
 
         if (! $user->twoFactorPending() || ! TwoFactorSetup::allowed($user)) {
-            return back()->withErrors(['code' => 'Start two-factor setup first.']);
+            return back()->withErrors(['code' => __('Start two-factor setup first.')]);
         }
 
         $code = preg_replace('/\s+/', '', (string) $request->input('code'));
         if (! $this->google2fa->verifyKey((string) $user->two_factor_secret, $code)) {
-            return back()->withErrors(['code' => 'That code is invalid. Check your authenticator app and try again.']);
+            return back()->withErrors(['code' => __('That code is invalid. Check your authenticator app and try again.')]);
         }
 
         RecordsModelChanges::withoutRecording(fn () => $user->forceFill(['two_factor_confirmed_at' => now()])->save());

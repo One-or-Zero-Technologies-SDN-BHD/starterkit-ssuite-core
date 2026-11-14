@@ -75,7 +75,7 @@ class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
 
     public function verifyPayment(string $purchaseId): array
     {
-        $response = $this->http()->get("{$this->baseUrl}/purchases/{$purchaseId}/");
+        $response = $this->http()->retry(2, 200, throw: false)->get("{$this->baseUrl}/purchases/{$purchaseId}/");
 
         $data = $response->json();
 
@@ -331,9 +331,15 @@ class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
 
     // ---------------------------------------------------------------- helpers
 
+    /**
+     * Every CHIP call goes through Http::outbound() (request + connect timeouts).
+     * Writes are deliberately NOT retried: a retried purchase creation or charge
+     * can produce two purchases — and two charges. A timed-out charge is an
+     * unknown outcome that chargeInstrument() resolves on the next run.
+     */
     protected function http()
     {
-        return Http::withToken((string) $this->secretKey)->acceptJson()->timeout(30);
+        return Http::outbound()->withToken((string) $this->secretKey)->acceptJson();
     }
 
     /** CHIP's callback-signing key for this account, or null when it can't be fetched. */

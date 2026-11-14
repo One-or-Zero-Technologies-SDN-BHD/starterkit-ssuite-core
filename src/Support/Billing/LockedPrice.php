@@ -6,6 +6,7 @@ use App\Models\Plan;
 use App\Models\Subscription;
 use App\Support\Billing\CheckoutPricing;
 use App\Support\Billing\Currency;
+use Illuminate\Validation\ValidationException;
 
 /**
  * Existing subscribers keep the price they signed up at. A later price rise
@@ -64,10 +65,16 @@ class LockedPrice
     public static function reprice(Subscription $subscription): void
     {
         $plan = $subscription->plan;
+        $currency = Currency::normalize($subscription->currency);
+        if (! $plan || ((float) $plan->price > 0 && $plan->priceFor('monthly', $currency) <= 0)) {
+            throw ValidationException::withMessages([
+                'plan' => __('Current pricing is unavailable in this subscription\'s currency. Set a price before repricing.'),
+            ]);
+        }
 
         $subscription->update([
-            'locked_price' => self::lock((float) ($plan?->price ?? 0), null),
-            'locked_price_yearly' => self::lock((float) ($plan?->price_yearly ?? 0), null),
+            'locked_price' => self::lock($plan->priceFor('monthly', $currency), null),
+            'locked_price_yearly' => self::lock($plan->priceFor('yearly', $currency), null),
         ]);
     }
 

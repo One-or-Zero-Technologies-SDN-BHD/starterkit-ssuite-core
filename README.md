@@ -19,10 +19,20 @@ override a method in its subclass when it genuinely needs to differ.
 | Billing rules | `Support\Billing\` `Currency`, `Tax`, `CheckoutPricing`, `LockedPrice`, `PlanChange`, `OnlinePayments`, `OverLimitGuard`, `OverPlanLimit`, `PaymentVerification`, `SubscriptionActivation`, `SubscriptionSource`, `SubscriptionStatus`, `SubscriptionTerm`, `SubscriptionTransition` |
 | Payments | `Services\Payment\` `PaymentGatewayFactory`, `PaymentGatewayInterface`, `SupportsRecurringPayments`, `UnknownChargeOutcome`, `Gateways\ChipGateway`, `Gateways\StripeGateway` |
 | Sign-in and 2FA | `Support\AuthenticationSession`, `Http\Middleware\EnforceTwoFactor`, `Http\Controllers\Auth\TwoFactorController`, `Http\Controllers\Auth\TwoFactorChallengeController` |
-| Team members | `Http\Controllers\TenantUserController` |
+| Team members | `Http\Controllers\TenantUserController`, `Http\Middleware\EnsureWorkspaceRoleDelegation` |
 
 An app whose copy of a file had already drifted from the template keeps its own copy
 until it is reconciled; it does not use the package class for that file.
+
+## Outbound HTTP timeouts
+
+The Stripe and CHIP gateways send every request through `Http::outbound()`, which the
+package registers unless the app already defines it.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `services.outbound.timeout` | `10` | Seconds a gateway request may take |
+| `services.outbound.connect_timeout` | `5` | Seconds to establish the connection |
 
 ## Central migration lock
 

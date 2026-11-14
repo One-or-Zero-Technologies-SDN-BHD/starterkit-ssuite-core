@@ -48,9 +48,9 @@ class TwoFactorChallengeController extends Controller
             $request->session()->put('two_factor_verified', true);
 
             return redirect()->intended(route('dashboard'))
-                ->with('warning', 'You signed in with a recovery code. Regenerate your codes from your profile.');
+                ->with('warning', __('You signed in with a recovery code. Regenerate your codes from your profile.'));
         }
 
-        return back()->withErrors(['auth' => 'Invalid authentication code.']);
+        return back()->withErrors(['auth' => __('Invalid authentication code.')]);
     }
 }

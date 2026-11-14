@@ -244,7 +244,7 @@ class PlanGate
             $plan = $this->current();
 
             return redirect()->back()
-                ->with('error', "The {$plan->name} plan does not include this feature. Please upgrade to access it.");
+                ->with('error', __('The :plan plan does not include this feature. Please upgrade to access it.', ['plan' => $plan->name]));
         }
 
         return null;
@@ -267,7 +267,7 @@ class PlanGate
      * we fall back to the legacy plans.allowed_modules check, so behaviour is
      * unchanged until central control is switched on per feature.
      */
-    private function moduleAllowed(string $module): bool
+    protected function moduleAllowed(string $module): bool
     {
         return Feature::canUse(
             config('app.product_key').'.'.$module,
@@ -332,17 +332,17 @@ class PlanGate
 
         return redirect()
             ->route('subscription.index')
-            ->with('error', 'This feature requires an add-on subscription. Please activate it below.');
+            ->with('error', __('This feature requires an add-on subscription. Please activate it below.'));
     }
 
-    private function isAdmin(): bool
+    protected function isAdmin(): bool
     {
         $user = auth()->user();
 
         return $user && $user->can('admin-access');
     }
 
-    private function defaultPlan(): Plan
+    protected function defaultPlan(): Plan
     {
         return Plan::forProduct()->defaultPlan()->first()
             ?? Plan::forProduct()->first()

@@ -364,7 +364,10 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
                 throw new UnknownChargeOutcome('Stripe PaymentIntent '.$gatewayRef.' could not be read (HTTP '.$response->status().').', $gatewayRef);
             }
 
-            return $this->intentResult((array) $response->json());
+            $intent = $response->json();
+            $this->assertLookupIntent($intent, $reference, $gatewayRef);
+
+            return $this->intentResult($intent);
         }
 
         // No id kept: search by our reference (not available on every account).
@@ -373,13 +376,38 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
             'limit' => 10,
         ]);
         if (! $search->successful()) {
-            return null;
+            throw new UnknownChargeOutcome('Stripe charge search could not be completed (HTTP '.$search->status().').');
         }
-
-        $intents = collect((array) $search->json('data', []))->sortByDesc('created');
+        $result = $search->json();
+        if (! is_array($result) || ($result['object'] ?? null) !== 'search_result'
+            || ! isset($result['data']) || ! is_array($result['data']) || ! array_is_list($result['data'])
+            || ! array_key_exists('has_more', $result) || $result['has_more'] !== false) {
+            // Missing/partial results are not proof that no earlier charge exists.
+            throw new UnknownChargeOutcome('Stripe charge search returned an incomplete or invalid result.');
+        }
+        foreach ($result['data'] as $intent) {
+            $this->assertLookupIntent($intent, $reference);
+        }
+        $intents = collect($result['data'])->sortByDesc('created');
         $intent = $intents->firstWhere('status', 'succeeded') ?? $intents->first();
 
-        return $intent ? $this->intentResult((array) $intent) : null;
+        return $intent ? $this->intentResult($intent) : null;
+    }
+
+    /** A failed, mismatched or malformed lookup never authorizes another charge. */
+    private function assertLookupIntent(mixed $intent, string $reference, ?string $expectedId = null): void
+    {
+        if (! is_array($intent) || ! is_string($intent['id'] ?? null) || ! str_starts_with($intent['id'], 'pi_')
+            || ! is_string($intent['status'] ?? null) || ! is_array($intent['metadata'] ?? null)
+            || ($intent['metadata']['reference_id'] ?? null) !== $reference
+            || ($expectedId !== null && $intent['id'] !== $expectedId)) {
+            throw new UnknownChargeOutcome('Stripe charge lookup did not identify the expected renewal.', $expectedId);
+        }
+        if ($intent['status'] === 'succeeded'
+            && (! is_numeric($intent['amount_received'] ?? $intent['amount'] ?? null)
+                || ! is_string($intent['currency'] ?? null) || trim($intent['currency']) === '')) {
+            throw new UnknownChargeOutcome('Stripe charge lookup omitted the paid amount or currency.', $intent['id']);
+        }
     }
 
     public function revokeInstrument(string $token): bool
@@ -435,7 +463,8 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
 
     protected function http()
     {
-        return Http::withToken((string) $this->secretKey)->asForm()->acceptJson()->timeout(30);
+        // Http::outbound(): request + connect timeouts on every Stripe call.
+        return Http::outbound()->withToken((string) $this->secretKey)->asForm()->acceptJson();
     }
 
     /** @return array<string, mixed> */

@@ -70,7 +70,7 @@ class EnforceTwoFactor
             }
 
             if ($request->expectsJson()) {
-                return response()->json(['message' => 'Two-factor verification required.'], 423);
+                return response()->json(['message' => __('Two-factor verification required.')], 423);
             }
 
             return redirect()->guest(route('two-factor.challenge'));
@@ -79,13 +79,13 @@ class EnforceTwoFactor
         // 2) Plan requires 2FA but the user hasn't enrolled → soft nudge.
         if ($this->planRequiresTwoFactor($user) && ! $request->routeIs(...self::NUDGE_BYPASS_ROUTES)) {
             if ($request->expectsJson()) {
-                return response()->json(['message' => 'Two-factor authentication is required for your plan.'], 423);
+                return response()->json(['message' => __('Two-factor authentication is required for your plan.')], 423);
             }
 
             // Straight to the Security tab, where the 2FA form is (the bare
             // profile URL opened on "Profile" with no visible reason).
             return redirect()->to(route('profile.edit').'#security')
-                ->with('warning', 'Your plan requires two-factor authentication. Please enable it now to keep your account secure.');
+                ->with('warning', __('Your plan requires two-factor authentication. Please enable it now to keep your account secure.'));
         }
 
         return $next($request);

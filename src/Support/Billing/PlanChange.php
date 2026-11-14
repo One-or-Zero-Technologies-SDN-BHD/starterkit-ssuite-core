@@ -45,11 +45,17 @@ class PlanChange
     public static function isDowngrade(Subscription $current, Plan $target): bool
     {
         $currentPlan = $current->plan;
+        $currentPrice = $currentPlan?->priceFor('monthly') ?? 0;
+        $targetPrice = $target->priceFor('monthly');
 
         return $currentPlan !== null
             && (int) $currentPlan->getKey() !== (int) $target->getKey()
             && (float) $currentPlan->price > 0
-            && (float) $target->price < (float) $currentPlan->price;
+            // Currency-specific prices may have a different ordering from
+            // base MYR prices. Free remains a downgrade even if the old paid
+            // plan is no longer offered in today's billing currency.
+            && ((float) $target->price <= 0
+                || ($targetPrice > 0 && $currentPrice > $targetPrice));
     }
 
     /**
