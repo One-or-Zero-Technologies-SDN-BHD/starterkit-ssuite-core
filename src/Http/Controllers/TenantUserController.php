@@ -15,10 +15,16 @@ use App\Notifications\NewMemberJoinedWorkspace;
 use App\Services\WorkspaceSeatGuard;
 use App\Support\Team\TeamRoster;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Spatie\Permission\Models\Role;
+use Spatie\Permission\PermissionRegistrar;
+use Ssuite\Core\Http\Middleware\EnsureWorkspaceRoleDelegation;
 use Ssuite\Core\Support\Team\InvitationDelivery;
 
 class TenantUserController extends Controller
@@ -35,8 +41,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-list');
+            $this->authorizeTeamAbility($tenant, 'list');
         }
 
         $roster = TeamRoster::for($tenant);
@@ -57,8 +62,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-create');
+            $this->authorizeTeamAbility($tenant, 'create');
         }
 
         $email = trim((string) $request->query('email', ''));
@@ -106,8 +110,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-create');
+            $this->authorizeTeamAbility($tenant, 'create');
         }
 
         $roles = Role::where('team_id', $tenant->id)->get();
@@ -117,9 +120,16 @@ class TenantUserController extends Controller
                 ->with('error', 'Please create at least one role (e.g. Manager, Editor) before inviting members to your team.');
         }
 
+        $roles = $this->offeredRoles($tenant, $roles);
+
+        if ($roles->isEmpty()) {
+            return redirect()->route('tenants.users.index', $tenant)
+                ->with('error', __('Every role here can do things your own role can’t, so you can’t give any of them out. Ask the workspace owner.'));
+        }
+
         $roster = TeamRoster::for($tenant);
         $seats = $roster->seats();
-        $roleCards = $this->roleCards($roster);
+        $roleCards = $this->roleCards($roster, $roles);
 
         return view('tenants.users.create', compact('tenant', 'roles', 'seats', 'roleCards'));
     }
@@ -141,8 +151,7 @@ class TenantUserController extends Controller
                 $this->authorizeWorkspace($tenant);
 
                 if (! $isAdmin && ! $isOwner) {
-                    setPermissionsTeamId($tenant->id);
-                    $this->authorize('team-user-create');
+                    $this->authorizeTeamAbility($tenant, 'create');
                 }
             },
         );
@@ -263,8 +272,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-edit');
+            $this->authorizeTeamAbility($tenant, 'edit');
         }
 
         $roster = TeamRoster::for($tenant);
@@ -283,7 +291,8 @@ class TenantUserController extends Controller
         $roles = Role::where('team_id', $tenant->id)->get();
         // Current role for this workspace, read for this team explicitly.
         $currentRole = $roles->firstWhere('name', $roster->roleNamesFor($user)[0] ?? null);
-        $roleCards = $this->roleCards($roster);
+        $roles = $this->offeredRoles($tenant, $roles);
+        $roleCards = $this->roleCards($roster, $roles);
         $membership = $roster->pivotRows()[(int) $user->id] ?? null;
         $isPending = $roster->isPending($user);
 
@@ -303,8 +312,7 @@ class TenantUserController extends Controller
         }
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-edit');
+            $this->authorizeTeamAbility($tenant, 'edit');
         }
 
         if ($roster->isOwner($user)) {
@@ -312,7 +320,13 @@ class TenantUserController extends Controller
                 ->with('error', __("The workspace owner always has full access — there's no role to change."));
         }
 
+        // A workspace role grants no authority over the shared sign-in. Older
+        // forms may still submit the unchanged email and the "keep" option.
+        $credentialError = __('Manage sign-in details through the account profile or password reset.');
         $request->validate([
+            'email' => ['sometimes', Rule::in([$user->email])],
+            'password_option' => ['sometimes', 'in:keep'],
+            'password' => ['prohibited'],
             'role' => [
                 'required',
                 'exists:roles,name',
@@ -329,6 +343,10 @@ class TenantUserController extends Controller
                     }
                 },
             ],
+        ], [
+            'email.in' => $credentialError,
+            'password_option.in' => $credentialError,
+            'password.prohibited' => $credentialError,
         ]);
 
         if ($roster->roleNamesFor($user) === [$request->role]) {
@@ -336,10 +354,12 @@ class TenantUserController extends Controller
                 ->with('success', __(':name already has the :role role.', ['name' => $user->name, 'role' => $request->role]));
         }
 
-        // Sync role for this team
-        setPermissionsTeamId($tenant->id);
-
-        $user->syncRoles([$request->role]);
+        // The role is resolved for THIS workspace before it is handed over, so a
+        // platform role that happens to share the name can never be the one given.
+        $targetRole = Role::query()->where('team_id', $tenant->id)->where('guard_name', 'web')
+            ->where('name', $request->role)->firstOrFail();
+        $this->workspaceMember($tenant, $user)->syncRoles([$targetRole]);
+        $user->unsetRelation('roles')->unsetRelation('permissions');
 
         $this->notifyMemberOfRoleChange($tenant, $user, (string) $request->role);
 
@@ -361,8 +381,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-delete');
+            $this->authorizeTeamAbility($tenant, 'delete');
         }
 
         $roster = TeamRoster::for($tenant);
@@ -394,8 +413,7 @@ class TenantUserController extends Controller
         $this->authorizeWorkspace($tenant);
 
         if (! Auth::user()->can('admin-access') && $tenant->user_id !== Auth::id()) {
-            setPermissionsTeamId($tenant->id);
-            $this->authorize('team-user-create');
+            $this->authorizeTeamAbility($tenant, 'create');
         }
 
         $roster = TeamRoster::for($tenant);
@@ -459,13 +477,35 @@ class TenantUserController extends Controller
     }
 
     /**
-     * The acting user must belong to this workspace (owner or member). Platform
-     * administrators pass through the Gate. An app without a workspace policy
-     * overrides this with its own check.
+     * The acting user must belong to this workspace (owner or member), or be a
+     * platform administrator. Asks the app's workspace policy when it has one
+     * with an access() rule, and the team roster otherwise.
      */
     protected function authorizeWorkspace(Tenant $tenant): void
     {
-        $this->authorize('access', $tenant);
+        $policy = Gate::getPolicyFor($tenant);
+
+        if ($policy && method_exists($policy, 'access')) {
+            $this->authorize('access', $tenant);
+
+            return;
+        }
+
+        $user = Auth::user();
+        abort_unless(TeamRoster::for($tenant)->isMember($user) || $user->can('admin-access'), 403);
+    }
+
+    /**
+     * The acting member needs the team permission for this action in THIS
+     * workspace. Roles are re-read for the workspace first: a relation loaded
+     * earlier in the request may belong to another workspace or to none.
+     */
+    protected function authorizeTeamAbility(Tenant $tenant, string $action): void
+    {
+        setPermissionsTeamId($tenant->id);
+        Auth::user()->unsetRelation('roles')->unsetRelation('permissions');
+
+        $this->authorize(TeamRoster::ability('members', $action));
     }
 
     /**
@@ -476,10 +516,40 @@ class TenantUserController extends Controller
     {
         TeamRoster::for($tenant)->pivot()->where('user_id', $user->id)->delete();
 
-        setPermissionsTeamId($tenant->id);
+        $member = $this->workspaceMember($tenant, $user);
+        $member->syncRoles([]);
+        $member->permissions()->detach();
+
+        // Whatever the relation left behind goes too: no role in this
+        // workspace may outlive the membership.
+        $roleModel = config('permission.models.role');
+        DB::connection((new $roleModel)->getConnectionName())
+            ->table(config('permission.table_names.model_has_roles', 'model_has_roles'))
+            ->where(config('permission.column_names.team_foreign_key', 'team_id'), $tenant->id)
+            ->where('model_type', $user->getMorphClass())
+            ->where(config('permission.column_names.model_morph_key', 'model_id'), $user->id)
+            ->delete();
+
         $user->unsetRelation('roles')->unsetRelation('permissions');
-        $user->syncRoles([]);
-        $user->permissions()->detach();
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+    }
+
+    /**
+     * The member as this workspace's database sees them, for writing roles and
+     * permissions. Role rows live with the workspace, the account lives in the
+     * shared database; writing through the workspace's connection keeps every
+     * role write on one connection, as TeamRoster::assignRole() does. The
+     * account itself is never saved through this copy.
+     */
+    protected function workspaceMember(Tenant $tenant, User $user): User
+    {
+        setPermissionsTeamId($tenant->id);
+
+        $member = clone $user;
+        $member->setConnection($tenant->getConnectionName());
+        $member->unsetRelation('roles')->unsetRelation('permissions');
+
+        return $member;
     }
 
     /**
@@ -510,12 +580,53 @@ class TenantUserController extends Controller
     /**
      * The workspace's roles as the role picker shows them.
      *
+     * @param  iterable<int, Role>|null  $roles  limit the cards to these roles
      * @return list<array<string, mixed>>
      */
-    protected function roleCards(TeamRoster $roster): array
+    protected function roleCards(TeamRoster $roster, $roles = null): array
     {
-        $offered = app(TenantRoleController::class)->assignablePermissions($roster->tenant())->pluck('name')->all();
+        $assignable = $this->assignablePermissionNames($roster->tenant());
+        $offered = $roles === null ? null : collect($roles)->pluck('id')->map(fn ($id) => (int) $id)->all();
 
-        return $roster->roles()->map(fn ($role) => $roster->summarise($role, $offered))->values()->all();
+        return $roster->roles()
+            ->when($offered !== null, fn ($all) => $all->filter(fn ($role) => in_array((int) $role->id, $offered, true)))
+            ->map(fn ($role) => $this->roleCard($roster, $role, $assignable))
+            ->values()
+            ->all();
+    }
+
+    /**
+     * The permission names a workspace role could hold: what a role card's
+     * "full access" is counted against. Matches what the role editor offers.
+     *
+     * @return list<string>
+     */
+    protected function assignablePermissionNames(Tenant $tenant): array
+    {
+        return app(TenantRoleController::class)->assignablePermissions($tenant)->pluck('name')->values()->all();
+    }
+
+    /**
+     * One role as the role picker shows it.
+     *
+     * @param  list<string>  $assignable
+     * @return array<string, mixed>
+     */
+    protected function roleCard(TeamRoster $roster, $role, array $assignable): array
+    {
+        return $roster->summarise($role, $assignable);
+    }
+
+    /**
+     * The roles the acting user may hand out: a member sees only roles that
+     * allow nothing beyond their own. The role-delegation middleware enforces
+     * the same rule on save; this keeps the picker honest.
+     *
+     * @param  Collection<int, Role>  $roles
+     * @return Collection<int, Role>
+     */
+    protected function offeredRoles(Tenant $tenant, $roles)
+    {
+        return app(EnsureWorkspaceRoleDelegation::class)->rolesActorMayHandOut(Auth::user(), $tenant, collect($roles));
     }
 }

@@ -158,6 +158,28 @@ class EnsureWorkspaceRoleDelegation
      * @param  Collection<int, string>  $requested
      * @return list<string>
      */
+    /**
+     * The roles the actor may hand out in this workspace: those that allow
+     * nothing beyond what the actor holds. The owner and platform
+     * administrators may hand out every role.
+     *
+     * @template TRole of \Spatie\Permission\Models\Role
+     *
+     * @param  Collection<int, TRole>  $roles
+     * @return Collection<int, TRole>
+     */
+    public function rolesActorMayHandOut(User $actor, Tenant $tenant, Collection $roles): Collection
+    {
+        if (TeamRoster::for($tenant)->isOwner($actor) || $actor->can('admin-access')) {
+            return $roles->values();
+        }
+
+        $held = $this->workspacePermissions($actor, $tenant);
+        $roles->each(fn ($role) => $role->loadMissing('permissions'));
+
+        return $roles->filter(fn ($role) => $this->missing($held, $role->permissions->pluck('name')) === [])->values();
+    }
+
     protected function missing(Collection $held, Collection $requested): array
     {
         return $requested->diff($held)->unique()->values()->all();
