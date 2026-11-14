@@ -310,7 +310,7 @@ class SubscriptionService
         });
     }
 
-    private function replaceWithFree(Plan $plan, ?Tenant $tenant, int $userId): Subscription
+    protected function replaceWithFree(Plan $plan, ?Tenant $tenant, int $userId): Subscription
     {
         Subscription::forProduct()
             ->whereIn('status', ['active', 'free'])
@@ -380,7 +380,7 @@ class SubscriptionService
     }
 
     /** A payment callback may have funded the schedule since the caller loaded it. */
-    private function updateUnpaidSchedule(Subscription $current, array $attributes): bool
+    protected function updateUnpaidSchedule(Subscription $current, array $attributes): bool
     {
         return DB::connection('central')->transaction(function () use ($current, $attributes): bool {
             $locked = Subscription::query()->forProduct()->lockForUpdate()->find($current->id);
@@ -457,7 +457,7 @@ class SubscriptionService
     }
 
     /** Start the early-paid scheduled plan where the old term ends. */
-    private function switchToPaidPlan(Subscription $old, Plan $target, PaymentTransaction $payment, array $clear): Subscription
+    protected function switchToPaidPlan(Subscription $old, Plan $target, PaymentTransaction $payment, array $clear): Subscription
     {
         $cycle = $old->scheduled_billing_cycle ?: ($payment->billing_cycle ?: 'monthly');
         $startsAt = $old->ends_at->copy();
@@ -488,7 +488,7 @@ class SubscriptionService
     }
 
     /** The early payment for a scheduled plan: audited, coupon and affiliate coupon booked now. */
-    private function recordDeferredPayment(PaymentTransaction $transaction, Subscription $current, Plan $plan, string $billingCycle): void
+    protected function recordDeferredPayment(PaymentTransaction $transaction, Subscription $current, Plan $plan, string $billingCycle): void
     {
         $this->log('subscription_change_paid', $current, [
             'plan' => $current->plan?->name,
@@ -524,7 +524,7 @@ class SubscriptionService
      * current end. Items that need setup wait for an admin (status requested);
      * an add-on that is already live just extends. No coupons or commission.
      */
-    private function activateAddon(PaymentTransaction $transaction, array $gatewayResponse): void
+    protected function activateAddon(PaymentTransaction $transaction, array $gatewayResponse): void
     {
         $type = (string) $transaction->addon_type;
         $item = TenantAddon::catalog()[$type] ?? null;
@@ -628,7 +628,7 @@ class SubscriptionService
     }
 
     /** @param  array<string, mixed>  $details */
-    private function log(string $action, Subscription $subscription, array $details, ?int $actorId = null): void
+    protected function log(string $action, Subscription $subscription, array $details, ?int $actorId = null): void
     {
         rescue(fn () => ActivityLog::record(
             $action,

@@ -6,6 +6,7 @@ use App\Models\User;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
+use Ssuite\Core\Support\Auth\TwoFactorSession;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
@@ -13,7 +14,7 @@ use Symfony\Component\HttpFoundation\Response;
  *
  *  1. Session challenge — a user who HAS 2FA enabled must pass the per-session
  *     /two-factor-challenge (TOTP or recovery code) before reaching the app.
- *     Until session('two_factor_verified') is true, they are redirected there.
+ *     Until the challenge is verified for this user, they are redirected there.
  *
  *  2. Enrollment nudge — on plans that require 2FA (Pro+ tiers), a user who has
  *     NOT enrolled is soft-redirected to their profile to set it up.
@@ -64,7 +65,7 @@ class EnforceTwoFactor
 
         // 1) Enrolled but not yet verified this session → challenge.
         if ($this->hasTwoFactorEnabled($user)) {
-            if ($request->session()->get('two_factor_verified') === true
+            if (TwoFactorSession::verified($request)
                 || $request->routeIs(...self::CHALLENGE_BYPASS_ROUTES)) {
                 return $next($request);
             }
@@ -77,18 +78,39 @@ class EnforceTwoFactor
         }
 
         // 2) Plan requires 2FA but the user hasn't enrolled → soft nudge.
-        if ($this->planRequiresTwoFactor($user) && ! $request->routeIs(...self::NUDGE_BYPASS_ROUTES)) {
+        if ($this->requiresEnrollment($user) && ! $request->routeIs(...self::NUDGE_BYPASS_ROUTES)) {
+            $messages = $this->enrollmentMessages();
+
             if ($request->expectsJson()) {
-                return response()->json(['message' => __('Two-factor authentication is required for your plan.')], 423);
+                return response()->json(['message' => $messages['json']], 423);
             }
 
             // Straight to the Security tab, where the 2FA form is (the bare
             // profile URL opened on "Profile" with no visible reason).
             return redirect()->to(route('profile.edit').'#security')
-                ->with('warning', __('Your plan requires two-factor authentication. Please enable it now to keep your account secure.'));
+                ->with('warning', $messages['notice']);
         }
 
         return $next($request);
+    }
+
+    /** Whether this user must enrol before using the app. Override to add an app's own rule. */
+    protected function requiresEnrollment(User $user): bool
+    {
+        return $this->planRequiresTwoFactor($user);
+    }
+
+    /**
+     * What a user who must enrol is told.
+     *
+     * @return array{json: string, notice: string}
+     */
+    protected function enrollmentMessages(): array
+    {
+        return [
+            'json' => __('Two-factor authentication is required for your plan.'),
+            'notice' => __('Your plan requires two-factor authentication. Please enable it now to keep your account secure.'),
+        ];
     }
 
     /** Asked once per process: the schema cannot change under a live one. */

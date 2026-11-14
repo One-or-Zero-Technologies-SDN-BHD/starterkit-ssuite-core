@@ -11,6 +11,7 @@ use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use PragmaRX\Google2FA\Google2FA;
+use Ssuite\Core\Support\Auth\TwoFactorSession;
 
 /**
  * TOTP two-factor authentication management (enrollment side). Lives on the
@@ -62,7 +63,7 @@ class TwoFactorController extends Controller
         RecordsModelChanges::withoutRecording(fn () => $user->forceFill(['two_factor_confirmed_at' => now()])->save());
         ActivityLog::record('security.two_factor_enabled', $user, [], $user);
         // This session is already proven — don't immediately challenge them.
-        $request->session()->put('two_factor_verified', true);
+        TwoFactorSession::verify($request);
 
         $request->session()->forget('profile.two_factor_setup');
 
@@ -80,7 +81,7 @@ class TwoFactorController extends Controller
         ])->save());
         ActivityLog::record('security.two_factor_disabled', $request->user(), [], $request->user());
 
-        $request->session()->forget(['two_factor_verified', 'profile.two_factor_setup']);
+        TwoFactorSession::clear($request);
 
         return back()->with('status', 'two-factor-disabled');
     }

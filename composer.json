@@ -3,7 +3,7 @@
     "description": "Shared backend shell for the s-suite (starterkit-livewire lineage). Graduated, byte-stable shell files distributed to every app via composer update — the backend companion to neophyteheaven/ssuite-ui. See docs/TEMPLATE-PARITY.md.",
     "type": "library",
     "license": "proprietary",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "require": {
         "php": "^8.2",
         "illuminate/support": "^11.0 || ^12.0 || ^13.0"
