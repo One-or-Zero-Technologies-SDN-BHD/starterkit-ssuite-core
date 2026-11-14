@@ -91,9 +91,14 @@ class EnforceTwoFactor
         return $next($request);
     }
 
-    private function hasTwoFactorEnabled(User $user): bool
+    /** Asked once per process: the schema cannot change under a live one. */
+    private static ?bool $twoFactorColumnExists = null;
+
+    protected function hasTwoFactorEnabled(User $user): bool
     {
-        if (! Schema::connection('central')->hasColumn('users', 'two_factor_confirmed_at')) {
+        self::$twoFactorColumnExists ??= Schema::connection('central')->hasColumn('users', 'two_factor_confirmed_at');
+
+        if (! self::$twoFactorColumnExists) {
             return false;
         }
 
@@ -102,7 +107,7 @@ class EnforceTwoFactor
             : ! is_null($user->two_factor_confirmed_at);
     }
 
-    private function planRequiresTwoFactor(User $user): bool
+    protected function planRequiresTwoFactor(User $user): bool
     {
         try {
             $planName = strtolower((string) ($user->userPlan?->plan?->name ?? ''));

@@ -22,6 +22,7 @@ use App\Support\Billing\OnlinePayments;
 use App\Support\Billing\PaymentVerification;
 use App\Support\Billing\SubscriptionTerm;
 use App\Support\Billing\Tax;
+use Illuminate\Notifications\Notification;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -396,6 +397,12 @@ class SubscriptionRenewalService
         }
     }
 
+    /** What the owner is told when a renewal charge fails. Override to send the app's own notification. */
+    protected function paymentFailedNotification(Subscription $subscription, PaymentAttempt $attempt): Notification
+    {
+        return new PaymentFailed($subscription, $attempt, (int) $subscription->renewal_attempts);
+    }
+
     /** Meter the failure and dun the owner; the term is left for the ladder and grace. */
     private function onFailure(Subscription $subscription, PaymentAttempt $attempt, array $result): void
     {
@@ -412,7 +419,7 @@ class SubscriptionRenewalService
         ])->save();
 
         if ($owner = $this->owner($subscription)) {
-            rescue(fn () => $owner->notify(new PaymentFailed($subscription, $attempt, (int) $subscription->renewal_attempts)), null, false);
+            rescue(fn () => $owner->notify($this->paymentFailedNotification($subscription, $attempt)), null, false);
         }
 
         Log::warning('Auto-renewal failed', [

@@ -16,8 +16,9 @@ use Symfony\Component\HttpFoundation\Response;
  *
  * Runs on the team member and team role routes, so the rule holds whatever the
  * controller does. The workspace owner and platform administrators are exempt.
- * A refused web request returns to the form with a message naming what the
- * member lacks; a JSON request receives a 403.
+ * A member without the team permission for the action itself receives a 403.
+ * A member who has it but reaches beyond their own role is returned to the
+ * form with a message naming what they lack; a JSON request receives a 403.
  */
 class EnsureWorkspaceRoleDelegation
 {
@@ -34,6 +35,11 @@ class EnsureWorkspaceRoleDelegation
 
         abort_unless($roster->isMember($actor), 403);
         $held = $this->workspacePermissions($actor, $tenant);
+
+        // Someone who may not perform the action at all is simply forbidden; the
+        // explanations below are for members who manage the team.
+        $ability = $this->requiredAbility($request);
+        abort_if($ability !== null && ! $held->contains($ability), 403);
 
         $role = $request->route('role');
         if ($role instanceof Role && (int) $role->team_id === (int) $tenant->getKey()) {
@@ -78,6 +84,20 @@ class EnsureWorkspaceRoleDelegation
         }
 
         return $next($request);
+    }
+
+    /** The team permission the route's own action needs, as the Team controllers check it. */
+    protected function requiredAbility(Request $request): ?string
+    {
+        return match (true) {
+            $request->routeIs('tenants.users.store') => TeamRoster::ability('members', 'create'),
+            $request->routeIs('tenants.users.update') => TeamRoster::ability('members', 'edit'),
+            $request->routeIs('tenants.users.destroy') => TeamRoster::ability('members', 'delete'),
+            $request->routeIs('tenants.roles.store', 'tenants.roles.duplicate') => TeamRoster::ability('roles', 'create'),
+            $request->routeIs('tenants.roles.update') => TeamRoster::ability('roles', 'edit'),
+            $request->routeIs('tenants.roles.destroy') => TeamRoster::ability('roles', 'delete'),
+            default => null,
+        };
     }
 
     /**
