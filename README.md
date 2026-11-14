@@ -24,6 +24,15 @@ override a method in its subclass when it genuinely needs to differ.
 An app whose copy of a file had already drifted from the template keeps its own copy
 until it is reconciled; it does not use the package class for that file.
 
+## Team role delegation
+
+`Http\Middleware\EnsureWorkspaceRoleDelegation` sits on the team member and team role
+routes. A member who manages the team may only hand out, change, copy or remove what
+their own role covers; the workspace owner and platform administrators are exempt. A
+refused web request returns to the form with a message naming what the member lacks,
+and a JSON request receives a 403. An app can override `describe()` to use its own
+permission labels.
+
 ## Outbound HTTP timeouts
 
 The Stripe and CHIP gateways send every request through `Http::outbound()`, which the
