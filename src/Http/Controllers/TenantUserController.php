@@ -10,6 +10,8 @@ use App\Models\Plan;
 use App\Models\Tenant;
 use App\Models\User;
 use App\Models\UserPlan;
+use App\Notifications\MemberPermissionChanged;
+use App\Notifications\NewMemberJoinedWorkspace;
 use App\Services\WorkspaceSeatGuard;
 use App\Support\Team\TeamRoster;
 use Illuminate\Http\Request;
@@ -30,7 +32,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
             setPermissionsTeamId($tenant->id);
@@ -52,7 +54,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
             setPermissionsTeamId($tenant->id);
@@ -101,7 +103,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
             setPermissionsTeamId($tenant->id);
@@ -136,7 +138,7 @@ class TenantUserController extends Controller
             function (Tenant $tenant) {
                 $isOwner = $tenant->user_id === Auth::id();
                 $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-                $this->authorize('access', $tenant);
+                $this->authorizeWorkspace($tenant);
 
                 if (! $isAdmin && ! $isOwner) {
                     setPermissionsTeamId($tenant->id);
@@ -199,6 +201,8 @@ class TenantUserController extends Controller
             setPermissionsTeamId($tenant->id);
             TeamRoster::for($tenant)->assignRole($existingUser, $targetRole);
 
+            $this->notifyOwnerOfNewMember($tenant, $existingUser, $targetRole);
+
             $this->logActivity('invited_existing_user_to_website', $existingUser, [
                 'tenant_id' => $tenant->id,
                 'description' => "Added existing user '{$existingUser->email}' to workspace {$tenant->name} with role {$targetRole}",
@@ -239,6 +243,8 @@ class TenantUserController extends Controller
         setPermissionsTeamId($tenant->id);
         TeamRoster::for($tenant)->assignRole($user, $targetRole);
 
+        $this->notifyOwnerOfNewMember($tenant, $user, $targetRole);
+
         $this->logActivity('invited_user_to_website', $user, [
             'tenant_id' => $tenant->id,
             'description' => "Added new user '{$user->name}' to workspace {$tenant->name} with role {$targetRole}",
@@ -254,7 +260,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
             setPermissionsTeamId($tenant->id);
@@ -288,7 +294,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         $roster = TeamRoster::for($tenant);
 
@@ -335,6 +341,8 @@ class TenantUserController extends Controller
 
         $user->syncRoles([$request->role]);
 
+        $this->notifyMemberOfRoleChange($tenant, $user, (string) $request->role);
+
         $this->logActivity('updated_user_role', $user, [
             'tenant_id' => $tenant->id,
             'description' => "Updated role for '{$user->name}' in workspace {$tenant->name} to {$request->role}",
@@ -350,7 +358,7 @@ class TenantUserController extends Controller
     {
         $isOwner = $tenant->user_id === Auth::id();
         $isAdmin = Auth::user()->hasRole('Administrator') || Auth::user()->can('admin-access');
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! $isAdmin && ! $isOwner) {
             setPermissionsTeamId($tenant->id);
@@ -371,11 +379,7 @@ class TenantUserController extends Controller
             return back()->with('error', __("You can't remove yourself here. Ask the owner or another team admin."));
         }
 
-        $roster->pivot()->where('user_id', $user->id)->delete();
-
-        // Also remove roles for this team
-        setPermissionsTeamId($tenant->id);
-        $user->syncRoles([]);
+        $this->removeMembership($tenant, $user);
 
         $this->logActivity('removed_user_from_website', $user, [
             'tenant_id' => $tenant->id,
@@ -387,7 +391,7 @@ class TenantUserController extends Controller
 
     public function resendInvite(Tenant $tenant, User $user)
     {
-        $this->authorize('access', $tenant);
+        $this->authorizeWorkspace($tenant);
 
         if (! Auth::user()->can('admin-access') && $tenant->user_id !== Auth::id()) {
             setPermissionsTeamId($tenant->id);
@@ -412,6 +416,95 @@ class TenantUserController extends Controller
         $roster->pivot()->where('user_id', $user->id)->update(['invited_at' => now()]);
 
         return back()->with('success', __('Invite resent to :email.', ['email' => $user->email]));
+    }
+
+    /**
+     * A member leaves the workspace themselves.
+     *
+     * Asks for the password and the word LEAVE, so it cannot happen by a stray
+     * click. The owner cannot leave: ownership is transferred first.
+     */
+    public function leave(Request $request, Tenant $tenant)
+    {
+        $request->validateWithBag('workspaceLeave', [
+            'password' => ['required', 'current_password'],
+            'confirmation' => ['required', 'string', 'in:LEAVE'],
+        ]);
+
+        $user = $request->user();
+        $roster = TeamRoster::for($tenant);
+
+        if ($roster->isOwner($user)) {
+            return back()->withErrors([
+                'workspace' => __('Transfer workspace ownership before leaving this workspace.'),
+            ], 'workspaceLeave');
+        }
+
+        if (! $roster->isMember($user)) {
+            abort(404);
+        }
+
+        $this->removeMembership($tenant, $user);
+
+        if ((int) $request->session()->get('active_tenant_id') === (int) $tenant->id) {
+            $request->session()->forget('active_tenant_id');
+        }
+
+        $this->logActivity('left_workspace', $tenant, [
+            'tenant_id' => $tenant->id,
+            'description' => "Left workspace '{$tenant->name}'",
+        ]);
+
+        return redirect()->route('dashboard')->with('success', __('You have left this workspace.'));
+    }
+
+    /**
+     * The acting user must belong to this workspace (owner or member). Platform
+     * administrators pass through the Gate. An app without a workspace policy
+     * overrides this with its own check.
+     */
+    protected function authorizeWorkspace(Tenant $tenant): void
+    {
+        $this->authorize('access', $tenant);
+    }
+
+    /**
+     * Take a member off the workspace: the membership row, their roles in this
+     * workspace, and any permission granted to them directly in it.
+     */
+    protected function removeMembership(Tenant $tenant, User $user): void
+    {
+        TeamRoster::for($tenant)->pivot()->where('user_id', $user->id)->delete();
+
+        setPermissionsTeamId($tenant->id);
+        $user->unsetRelation('roles')->unsetRelation('permissions');
+        $user->syncRoles([]);
+        $user->permissions()->detach();
+    }
+
+    /**
+     * Tell the workspace owner that someone was added to the team. A failed
+     * notification never undoes the invitation.
+     */
+    protected function notifyOwnerOfNewMember(Tenant $tenant, User $member, string $role): void
+    {
+        rescue(fn () => optional($tenant->user)->notify(new NewMemberJoinedWorkspace([
+            'member' => $member->name ?? $member->email,
+            'email' => $member->email,
+            'workspace' => $tenant->name,
+            'role' => $role,
+        ])), null, false);
+    }
+
+    /**
+     * Tell a member that their role in the workspace changed.
+     */
+    protected function notifyMemberOfRoleChange(Tenant $tenant, User $member, string $role): void
+    {
+        rescue(fn () => $member->notify(new MemberPermissionChanged([
+            'workspace' => $tenant->name,
+            'role' => $role,
+        ])), null, false);
     }
 
     /**
