@@ -3,7 +3,7 @@
 Shared backend Composer package for the [Laravel Livewire Starter Kit](https://github.com/One-or-Zero-Technologies-SDN-BHD/starterkit-laravel-livewire).
 
 Every S-Suite app requires this package. A fix made here reaches an app on its next
-`composer update neophyteheaven/ssuite-core` — no hand-copying between repositories.
+`composer update ssuite/core` — no hand-copying between repositories.
 
 ## Graduated shell classes
 
@@ -59,3 +59,7 @@ process dies.
 | `SSUITE_CENTRAL_MIGRATION_LOCK_TIMEOUT` | `600` | Seconds a deploy waits before failing |
 
 Non-MySQL connections (for example SQLite in tests) are skipped.
+
+## Package identity
+
+The Composer package is `ssuite/core`, hosted in `One-or-Zero-Technologies-SDN-BHD/starterkit-ssuite-core`. Require `^0.5.0` for the renamed package. Release 0.5.0 changes package identity only: PHP classes stay under `Ssuite\Core`, and configuration keys, routes and database behavior are unchanged. The package declares no `replace` or `provide` alias. Private GitHub repository access remains necessary for deployment.
