@@ -4,11 +4,14 @@ namespace Ssuite\Core\Http\Middleware;
 
 use App\Models\Tenant;
 use App\Models\User;
+use App\Support\PlatformAccess;
 use App\Support\Team\TeamRoster;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Spatie\Permission\Models\Role;
+use Spatie\Permission\PermissionRegistrar;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
@@ -27,6 +30,56 @@ class EnsureWorkspaceRoleDelegation
         $actor = $request->user();
         $tenant = $request->route('tenant');
         abort_unless($actor instanceof User && $tenant instanceof Tenant, 403);
+
+        // Every team mutation, including owner/admin writes, shares the same
+        // admission lock. Keep it through the controller's committed writes.
+        $connection = $tenant->getConnection();
+        if (! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return $this->handleCurrentState($request, $next, $actor, $tenant);
+        }
+
+        $name = 'ssuite-team:'.substr(hash('sha256', $connection->getDatabaseName().'|'.$tenant->getKey()), 0, 48);
+        // A dedicated session avoids coupling lock ownership to transactions
+        // and to controllers that write role pivots through another connection.
+        $lockConnection = 'ssuite_team_lock_'.bin2hex(random_bytes(8));
+        $lock = DB::connectUsing($lockConnection, $connection->getConfig());
+        $pdo = $lock->getPdo();
+        $acquired = false;
+
+        try {
+            $statement = $pdo->prepare('SELECT GET_LOCK(?, 10)');
+            $statement->execute([$name]);
+            $acquired = (int) $statement->fetchColumn() === 1;
+            abort_unless($acquired, 503, __('Team permissions are being updated. Please try again.'));
+
+            return $this->handleCurrentState($request, $next, $actor, $tenant);
+        } finally {
+            try {
+                if ($acquired) {
+                    $statement = $pdo->prepare('SELECT RELEASE_LOCK(?)');
+                    $statement->execute([$name]);
+                }
+            } finally {
+                DB::purge($lockConnection);
+            }
+        }
+    }
+
+    protected function handleCurrentState(Request $request, Closure $next, User $actor, Tenant $tenant): Response
+    {
+        // Route binding and permission relations may have been read before a
+        // competing request finished. Re-evaluate them after obtaining admission.
+        $tenant->refresh();
+        $role = $request->route('role');
+        if ($role instanceof Role) {
+            $role->refresh();
+            $role->unsetRelation('permissions');
+        }
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+        $actor->unsetRelation('roles')->unsetRelation('permissions');
+        if (class_exists(PlatformAccess::class)) {
+            PlatformAccess::for()->forget();
+        }
 
         $roster = TeamRoster::for($tenant);
         if ($roster->isOwner($actor) || $actor->can('admin-access')) {

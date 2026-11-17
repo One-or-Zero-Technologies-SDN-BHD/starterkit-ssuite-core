@@ -6,6 +6,7 @@ use App\Models\Plan;
 use App\Models\Subscription;
 use App\Models\Tenant;
 use App\Models\TenantPlan;
+use App\Models\UserPlan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -59,7 +60,9 @@ class PlanResolver
     /** Forget a workspace's cached plan (call after any plan mutation). */
     public static function bust(int|string $tenantId): void
     {
-        Cache::forget(self::cacheKey((int) $tenantId));
+        Cache::forget("billing:tenant-plan:{$tenantId}");
+        Cache::forget(self::cacheKey((int) $tenantId, false));
+        Cache::forget(self::cacheKey((int) $tenantId, true));
     }
 
     /**
@@ -225,9 +228,11 @@ class PlanResolver
         return false;
     }
 
-    private static function cacheKey(int $tenantId): string
+    private static function cacheKey(int $tenantId, ?bool $userFallback = null): string
     {
-        return "billing:tenant-plan:{$tenantId}";
+        $mode = (int) ($userFallback ?? (bool) config('billing.user_fallback'));
+
+        return 'billing:tenant-plan:v2:'.config('app.product_key').":{$tenantId}:{$mode}";
     }
 
     private static function resolve(Tenant|int $tenant): ?int
@@ -259,7 +264,13 @@ class PlanResolver
 
         // 2. Transition fallback: the owner's user-level plan.
         if (config('billing.user_fallback')) {
-            $ownerPlan = $tenant->user?->plan;
+            // Read the newest assignment before checking eligibility. Filtering
+            // first could revive an older paid row after a later cancellation.
+            $assignment = UserPlan::where('user_id', $tenant->user_id)->latest('id')->first();
+            $ownerPlan = $assignment && $assignment->status === 'active'
+                && (! $assignment->starts_at || $assignment->starts_at->lte(now()))
+                && (! $assignment->ends_at || $assignment->ends_at->gt(now()))
+                    ? $assignment->plan : null;
             if ($ownerPlan && $ownerPlan->product === $productKey) {
                 return (int) $ownerPlan->id;
             }

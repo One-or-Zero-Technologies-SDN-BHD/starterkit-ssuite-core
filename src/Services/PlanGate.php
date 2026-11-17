@@ -8,6 +8,7 @@ use App\Models\Tenant;
 use App\Models\TenantAddon;
 use App\Models\TenantPlan;
 use App\Services\PlanResolver;
+use App\Support\Plans\PlanCatalog;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\RedirectResponse;
 
@@ -32,9 +33,8 @@ class PlanGate
      * unlocked nothing, and one person's plan leaked across every workspace
      * they owned.
      *
-     * The legacy fallback below still applies when a workspace has no plan row
-     * of its own: owner's user plan → product default. (Suite bundles were
-     * removed: customers subscribe per app.)
+     * PlanResolver also owns the eligible legacy owner fallback and product
+     * default. A missing result must not resurrect an expired owner assignment.
      *
      * There is NO shortcut for admin-owned workspaces. That shortcut used to
      * return the highest-tier plan whenever the OWNER held admin-access, so
@@ -44,19 +44,12 @@ class PlanGate
      */
     public function resolveFor(Tenant $tenant): Plan
     {
-        $owner = $tenant->user;
         $productKey = config('app.product_key');
 
         // 1) The workspace's own live plan.
         $workspacePlan = PlanResolver::for($tenant);
         if ($workspacePlan && $workspacePlan->product === $productKey) {
             return $workspacePlan;
-        }
-
-        // 2) Legacy: the owner's user-level plan.
-        $candidate = $owner?->plan;
-        if ($candidate && $candidate->product === $productKey) {
-            return $candidate;
         }
 
         return $this->defaultPlan();
@@ -219,17 +212,27 @@ class PlanGate
      */
     public function cap(string $planColumn): ?int
     {
+        $plan = $this->current();
+        if (! $plan->exists) {
+            return 0;
+        }
+
         return Feature::limit(
             config('app.product_key').'.'.$planColumn,
-            fn () => $this->current()->{$planColumn},
+            fn () => $plan->{$planColumn},
         );
     }
 
     public function capFor(Tenant $tenant, string $planColumn): ?int
     {
+        $plan = $this->resolveFor($tenant);
+        if (! $plan->exists) {
+            return 0;
+        }
+
         return Feature::for($tenant)->limit(
             config('app.product_key').'.'.$planColumn,
-            fn () => $this->resolveFor($tenant)->{$planColumn},
+            fn () => $plan->{$planColumn},
         );
     }
 
@@ -344,8 +347,16 @@ class PlanGate
 
     protected function defaultPlan(): Plan
     {
-        return Plan::forProduct()->defaultPlan()->first()
-            ?? Plan::forProduct()->first()
-            ?? new Plan;
+        if ($plan = Plan::forProduct()->defaultPlan()->first()) {
+            return $plan;
+        }
+
+        // A missing catalog cannot grant the first paid offer or unlimited caps.
+        return (new Plan)->forceFill([
+            ...array_fill_keys(array_keys(PlanCatalog::limits()), 0),
+            'name' => __('No active plan'), 'product' => config('app.product_key'),
+            'price' => 0, 'price_yearly' => 0, 'max_workspaces' => 0,
+            'allowed_modules' => [], 'can_use_custom_domain' => false,
+        ]);
     }
 }
