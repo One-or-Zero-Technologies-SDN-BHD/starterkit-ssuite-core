@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2 — 20 November 2026
+
+- Retain rejected-coupon projection cleanup intent until the actual workspace commit; retries finish cleanup without consuming another coupon use or granting a plan.
+- Resume cleanup-only recovery when a confirmed callback re-enters a payment held for coupon review. Preserve newer manual projections.
+
+
 ## 0.5.1 — 20 November 2026
 
 - Claim coupon eligibility and usage in the central activation transaction before ordinary, scheduled and recovered plan grants. Hold refused confirmed payments as `coupon_review`. Enforce once-per-user under the coupon lock.

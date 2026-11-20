@@ -43,6 +43,9 @@ class SubscriptionService
     public function activate(PaymentTransaction $transaction, array $gatewayResponse = [], array $pending = []): void
     {
         if ($transaction->status === CouponSettlement::REVIEW) {
+            // Review stays terminal: only a pending cleanup intent may resume.
+            SubscriptionActivation::for()->reconcile($transaction);
+
             return;
         }
 
