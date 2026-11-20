@@ -69,7 +69,8 @@ class CouponSettlement
             // Every coupon is once per user, matching checkout validation.
             if (CouponRedemption::where('coupon_id', $locked->id)
                 ->where('user_id', $transaction->user_id)
-                ->where('payment_transaction_id', '!=', $transaction->id)
+                ->where(fn ($query) => $query->whereNull('payment_transaction_id')
+                    ->orWhere('payment_transaction_id', '!=', $transaction->id))
                 ->lockForUpdate()->first()) {
                 return null;
             }

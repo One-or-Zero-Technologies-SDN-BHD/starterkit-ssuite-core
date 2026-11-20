@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3 — 2026-11-20
+
+- Count legacy coupon redemptions without a payment link in the locked once-per-user check. A nullable historical link cannot authorize a second discounted plan grant.
+- Regression coverage reproduces the second paid confirmation and requires coupon review without a new subscription or plan. Existing successful-payment replay stays idempotent.
+
 ## 0.5.2 — 20 November 2026
 
 - Retain rejected-coupon projection cleanup intent until the actual workspace commit; retries finish cleanup without consuming another coupon use or granting a plan.
