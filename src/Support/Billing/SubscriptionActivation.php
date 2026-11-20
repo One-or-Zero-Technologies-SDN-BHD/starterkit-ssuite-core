@@ -7,7 +7,6 @@ use App\Models\Subscription;
 use App\Models\TenantPlan;
 use App\Models\UserPlan;
 use App\Services\AffiliateService;
-use App\Services\CouponService;
 use App\Services\FeatureFlags;
 use App\Services\SubscriptionGrace;
 use Illuminate\Database\Connection;
@@ -59,7 +58,7 @@ class SubscriptionActivation
             try {
                 return $local->transaction(function () use ($local, $payment, $operation): mixed {
                     $row = PaymentTransaction::query()->forProduct()->lockForUpdate()->findOrFail($payment->getKey());
-                    if ($row->status === 'success') {
+                    if (in_array($row->status, ['success', CouponSettlement::REVIEW], true)) {
                         return null;
                     }
                     $result = $operation();
@@ -88,7 +87,7 @@ class SubscriptionActivation
                 $result = $central->transaction(function () use ($payment, $operation, &$cipher): mixed {
                     $row = PaymentTransaction::query()->forProduct()->lockForUpdate()->findOrFail($payment->getKey());
                     $beforeStatus = $row->status;
-                    if ($beforeStatus === 'success') {
+                    if (in_array($beforeStatus, ['success', CouponSettlement::REVIEW], true)) {
                         return null;
                     }
                     // Locking current reads serialize workspace projections and
@@ -160,7 +159,7 @@ class SubscriptionActivation
     {
         $row = PaymentTransaction::query()->forProduct()->find($payment->getKey());
 
-        return $row?->status === 'success' && $this->intent($row) !== null;
+        return $row && ($row->status === 'success' || $this->cleanupPending($row)) && $this->intent($row) !== null;
     }
 
     /** Returns none, superseded or recovered; never creates a new central sale or provider charge. */
@@ -180,13 +179,20 @@ class SubscriptionActivation
             $subscription = null;
             $result = $central->transaction(function () use ($payment, &$cipher, &$subscription): string {
                 $row = PaymentTransaction::query()->forProduct()->lockForUpdate()->find($payment->getKey());
-                $intent = $row?->status === 'success' ? $this->intent($row) : null;
+                $cleanup = $row && $this->cleanupPending($row);
+                $intent = $row && ($row->status === 'success' || $cleanup) ? $this->intent($row) : null;
                 if (! $intent) {
                     return 'none';
                 }
                 $cipher = $row->gateway_response[self::MARKER];
-                $subscription = $this->linkedSubscription($row);
-                if (! $subscription || (int) $subscription->id !== $intent['subscription_id'] || ! $this->latest($row, $subscription)) {
+                $subscription = $cleanup ? $this->cleanupSubscription($row, $intent) : $this->linkedSubscription($row);
+                $latest = $subscription && ($cleanup
+                    ? ! Subscription::query()->forProduct()->whereIn('status', ['active', 'free'])
+                        ->when($row->tenant_id, fn ($query) => $query->where('tenant_id', $row->tenant_id),
+                            fn ($query) => $query->whereNull('tenant_id')->where('user_id', $row->user_id))
+                        ->where('id', '>', $subscription->id)->exists()
+                    : $this->latest($row, $subscription));
+                if (! $subscription || (int) $subscription->id !== $intent['subscription_id'] || ! $latest) {
                     $subscription = null;
 
                     return 'superseded';
@@ -216,6 +222,37 @@ class SubscriptionActivation
                         return 'superseded';
                     }
                 }
+                // Recovery is a grant too. Claim legacy interrupted payments
+                // before any projection write or recovered side effect.
+                if ($cleanup || ! CouponSettlement::grant($row, $row->gateway_response ?? [], retainRecovery: true)) {
+                    // A legacy app commit may already have succeeded before its
+                    // worker died. Revert only the exact projection we own; the
+                    // comparisons above protect manual and newer changes.
+                    foreach (['tenant', 'user'] as $kind) {
+                        if (($kind === 'user' && $skipUser) || $current[$kind] !== $intent['desired'][$kind]
+                            || $current[$kind] === $intent['before'][$kind]) {
+                            continue;
+                        }
+                        $query = $kind === 'tenant'
+                            ? TenantPlan::query()->where('tenant_id', $row->tenant_id)
+                            : UserPlan::query()->where('user_id', $row->user_id);
+                        if ($intent['before'][$kind] === null) {
+                            $query->delete();
+                        } else {
+                            $query->update($intent['before'][$kind]);
+                        }
+                    }
+                    if ($row->subscription_id) {
+                        $subscription->update(['status' => 'cancelled', 'cancelled_at' => now(), 'auto_renew' => false]);
+                    } else {
+                        $subscription->update(['scheduled_transaction_id' => null]);
+                    }
+                    // Keep the original encrypted token until the actual app
+                    // commit. A failed app commit leaves a cleanup-only retry.
+                    $subscription = null;
+
+                    return CouponSettlement::REVIEW;
+                }
                 foreach (['tenant', 'user'] as $kind) {
                     $desired = $intent['desired'][$kind];
                     if ($desired === null || $intent['before'][$kind] === $desired || $current[$kind] === $desired || ($kind === 'user' && $skipUser)) {
@@ -235,7 +272,7 @@ class SubscriptionActivation
                     if ($result === 'recovered') {
                         $this->recoveredEffects($payment, $subscription);
                     }
-                    $this->complete($payment->id, $cipher);
+                    $this->complete($payment->id, $cipher, $result);
                 });
             }
 
@@ -344,6 +381,21 @@ class SubscriptionActivation
         return $intent;
     }
 
+    private function cleanupPending(PaymentTransaction $payment): bool
+    {
+        return $payment->status === CouponSettlement::REVIEW
+            && ($payment->gateway_response['_ssuite_coupon_review']['cleanup_pending'] ?? null) === true;
+    }
+
+    private function cleanupSubscription(PaymentTransaction $payment, array $intent): ?Subscription
+    {
+        return Subscription::query()->forProduct()->whereKey($intent['subscription_id'])
+            ->where('user_id', $payment->user_id)
+            ->when($payment->tenant_id, fn ($query) => $query->where('tenant_id', $payment->tenant_id),
+                fn ($query) => $query->whereNull('tenant_id'))
+            ->whereIn('status', ['active', 'cancelled'])->first();
+    }
+
     private function linkedSubscription(PaymentTransaction $payment): ?Subscription
     {
         return Subscription::query()->forProduct()
@@ -362,16 +414,21 @@ class SubscriptionActivation
             ->orderByDesc('id')->value('id') === (int) $subscription->id;
     }
 
-    private function complete(int $id, string $cipher): void
+    private function complete(int $id, string $cipher, string $result = 'recovered'): void
     {
         try {
-            DB::connection('central')->transaction(function () use ($id, $cipher): void {
+            DB::connection('central')->transaction(function () use ($id, $cipher, $result): void {
                 $row = PaymentTransaction::query()->forProduct()->lockForUpdate()->find($id);
                 $response = $row?->gateway_response ?? [];
                 if (($response[self::MARKER] ?? null) !== $cipher) {
                     return;
                 }
                 unset($response[self::MARKER]);
+                if ($this->cleanupPending($row)) {
+                    $response['_ssuite_coupon_review']['cleanup_pending'] = false;
+                    $response['_ssuite_coupon_review']['cleanup_result'] = $result === 'superseded' ? 'superseded' : 'cleaned-up';
+                    $response['_ssuite_coupon_review']['cleanup_completed_at'] = now()->toIso8601String();
+                }
                 $row->update(['gateway_response' => $response]);
             });
         } catch (Throwable $exception) {
@@ -388,9 +445,6 @@ class SubscriptionActivation
         rescue(fn () => AffiliateService::attributeCoupon($payment), null, false);
         if ($subscription && $payment->subscription_id) {
             rescue(fn () => AffiliateService::processSubscriptionCommission($subscription), null, false);
-        }
-        if ($payment->coupon_id) {
-            rescue(fn () => app(CouponService::class)->redeem($payment), null, false);
         }
     }
 }

@@ -63,3 +63,12 @@ Non-MySQL connections (for example SQLite in tests) are skipped.
 ## Package identity
 
 The Composer package is `ssuite/core`, hosted in `One-or-Zero-Technologies-SDN-BHD/starterkit-ssuite-core`. Require `^0.5.0` for the renamed package. Release 0.5.0 changes package identity only: PHP classes stay under `Ssuite\Core`, and configuration keys, routes and database behavior are unchanged. The package declares no `replace` or `provide` alias. Private GitHub repository access remains necessary for deployment.
+
+
+## Coupon settlement and ownership consent (20 November 2026)
+
+`Support\Billing\CouponSettlement` claims a coupon in the central activation transaction before an entitlement is granted. Refused confirmed claims enter `coupon_review`; normal callback retries do not activate that state. Own-transaction replay is idempotent, while caps, validity/activity and the existing once-per-user policy apply to new claims. Deferred funding and interrupted projection recovery follow the same rule. There are no checkout reservations or schema changes.
+
+`Support\Billing\PaymentInstruments` is the shared removal path for ordinary card removal and ownership transfers. App transfer callbacks call `ownershipChanged($tenant, $outgoingId, $incomingId)` under the existing workspace lock, before publishing ownership. Local consent is revoked first, subscription renewal links are disabled/detached, and gateway cleanup plus email notification to both owners follows the actual app commit. Gateway cleanup is best effort; local consent stays revoked if it fails. The renewal service uses the same workspace lock and checks the instrument's current owner before charging.
+
+These changes need a follow-up package release and app-owned controller hooks. Consumer lockfiles and local core-source edits are separate. SCount's independent activation service also needs the coupon-grant changes; merely updating its package is insufficient. The template's `docs/BILLING-COUPON-OWNERSHIP-FIXES-2026-11-20.md` lists pickup paths and regression coverage. No consumer release or live-provider acceptance is claimed here.

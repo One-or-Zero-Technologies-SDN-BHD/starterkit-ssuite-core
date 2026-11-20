@@ -7,6 +7,9 @@ use App\Models\PaymentTransaction;
 use App\Models\Plan;
 use App\Models\Subscription;
 use App\Models\TenantPlan;
+use App\Models\Tenant;
+use Illuminate\Support\Facades\DB;
+use Ssuite\Core\Support\Billing\PaymentInstruments;
 use App\Models\User;
 use App\Notifications\PaymentFailed;
 use App\Notifications\SubscriptionPaymentConfirmed;
@@ -123,6 +126,29 @@ class SubscriptionRenewalService
     /** Attempt one renewal and return an outcome code. */
     public function attemptRenewal(Subscription $subscription, bool $dryRun = false): string
     {
+        if ($subscription->product !== config('app.product_key')) {
+            return 'skipped_product';
+        }
+        if ($subscription->tenant_id) {
+            // The same app-DB workspace lock serializes transfer against a
+            // renewal, including retries and its eventual gateway call.
+            return DB::connection()->transaction(function () use ($subscription, $dryRun): string {
+                $tenant = Tenant::query()->lockForUpdate()->find($subscription->tenant_id);
+                if (! $tenant) {
+                    return 'skipped_no_owner';
+                }
+                $subscription->refresh();
+                $subscription->unsetRelation('paymentInstrument');
+
+                return $this->renewWithOwner($subscription, $dryRun, $tenant);
+            });
+        }
+
+        return $this->renewWithOwner($subscription, $dryRun);
+    }
+
+    private function renewWithOwner(Subscription $subscription, bool $dryRun, ?Tenant $tenant = null): string
+    {
         $periodEnd = $subscription->ends_at?->copy();
         if (! $periodEnd) {
             return 'skipped_no_term';
@@ -197,7 +223,9 @@ class SubscriptionRenewalService
 
         // Cards are per app: never charge a card saved by another S-Suite product.
         $instrument = $subscription->paymentInstrument;
-        if (! $instrument || ! $instrument->isChargeable($subscription->product)) {
+        if (! $instrument || ! $instrument->isChargeable($subscription->product)
+            || ($tenant && ! PaymentInstruments::belongsToOwner($instrument, $tenant))
+            || (! $tenant && ($instrument->tenant_id !== null || (int) $instrument->user_id !== (int) $subscription->user_id))) {
             return 'skipped_no_instrument';
         }
 
