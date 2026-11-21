@@ -12,7 +12,6 @@ use App\Models\TenantPlan;
 use App\Models\User;
 use App\Models\UserPlan;
 use App\Services\AffiliateService;
-use App\Services\CouponService;
 use App\Services\FeatureFlags;
 use App\Services\SubscriptionGrace;
 use App\Support\Billing\AddonSettlement;
@@ -24,14 +23,13 @@ use App\Support\Billing\SubscriptionTerm;
 use App\Support\Billing\SubscriptionTransition;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Ssuite\Core\Support\Billing\CouponSettlement;
 
 /**
  * Turns a successful payment into an active subscription.
  *
- * Extracted verbatim from SubscriptionController::activateSubscription so the
- * activation logic lives in a single, testable place off the controller (thinner
- * controllers drift less — see docs/TEMPLATE-PARITY.md). Behaviour is unchanged:
- * the controller now delegates here.
+ * Shared activation entry point. Payment and coupon claims precede the plan
+ * grant; app projections and post-commit effects are coordinated separately.
  */
 class SubscriptionService
 {
@@ -44,6 +42,13 @@ class SubscriptionService
      */
     public function activate(PaymentTransaction $transaction, array $gatewayResponse = [], array $pending = []): void
     {
+        if ($transaction->status === CouponSettlement::REVIEW) {
+            // Review stays terminal: only a pending cleanup intent may resume.
+            SubscriptionActivation::for()->reconcile($transaction);
+
+            return;
+        }
+
         if ($transaction->status === 'success') {
             SubscriptionActivation::for()->reconcile($transaction);
 
@@ -102,10 +107,18 @@ class SubscriptionService
                 // below throws, the claim rolls back with the rest and a gateway retry can
                 // still finish the job.
                 $claimed = PaymentTransaction::whereKey($transaction->getKey())
-                    ->where('status', '!=', 'success')
+                    ->whereNotIn('status', ['success', CouponSettlement::REVIEW])
                     ->update(['status' => 'success', 'paid_at' => now()]) > 0;
 
                 if (! $claimed) {
+                    return;
+                }
+
+                // A confirmed payment buys a discounted plan only if its coupon
+                // can still be claimed. The coupon lock lives through this commit.
+                if (! CouponSettlement::grant($transaction, $gatewayResponse)) {
+                    $claimed = false;
+
                     return;
                 }
 
@@ -279,14 +292,6 @@ class SubscriptionService
                     // the buyer wasn't referred already), so book that first.
                     rescue(fn () => AffiliateService::attributeCoupon($transaction), null, false);
                     rescue(fn () => AffiliateService::processSubscriptionCommission($subscription), null, false);
-                }
-
-                // Coupon redemption is recorded HERE — on confirmed payment — not at
-                // checkout, so an abandoned cart never burns a use. Reads the coupon off
-                // the transaction row (the gateway callback has no session), and is
-                // idempotent per transaction, so a replayed callback won't double-count.
-                if ($transaction->coupon_id) {
-                    rescue(fn () => app(CouponService::class)->redeem($transaction), null, false);
                 }
             });
         });
@@ -487,7 +492,7 @@ class SubscriptionService
         return $new;
     }
 
-    /** The early payment for a scheduled plan: audited, coupon and affiliate coupon booked now. */
+    /** Audit/attribution for a schedule whose coupon was claimed during settlement. */
     protected function recordDeferredPayment(PaymentTransaction $transaction, Subscription $current, Plan $plan, string $billingCycle): void
     {
         $this->log('subscription_change_paid', $current, [
@@ -499,10 +504,6 @@ class SubscriptionService
         ], $transaction->user_id ? (int) $transaction->user_id : null);
 
         rescue(fn () => AffiliateService::attributeCoupon($transaction), null, false);
-
-        if ($transaction->coupon_id) {
-            rescue(fn () => app(CouponService::class)->redeem($transaction), null, false);
-        }
     }
 
     /**

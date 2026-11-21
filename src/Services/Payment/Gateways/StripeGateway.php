@@ -11,6 +11,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use RuntimeException;
 
 /**
  * Stripe over its REST API (Laravel HTTP client, like the other adapters; the
@@ -134,7 +135,7 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
         $failed = ! $paid && (($data['status'] ?? null) === 'expired'
             || (($data['status'] ?? null) === 'complete' && in_array($intent['status'] ?? null, ['canceled', 'requires_payment_method'], true)));
 
-        return [
+        return $this->verifyReversal([
             'success' => $paid,
             'status' => $paid ? 'paid' : ($failed ? 'failed' : 'pending'),
             // For PaymentVerification::matches().
@@ -143,7 +144,7 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
             'currency' => (string) ($data['currency'] ?? ''),
             'payment_intent' => $intent,
             'data' => $data,
-        ];
+        ]);
     }
 
     /** A legacy (pi_…) payment: verify the PaymentIntent itself. */
@@ -162,7 +163,7 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
             default => 'pending',
         };
 
-        return [
+        return $this->verifyReversal([
             'success' => $status === 'paid',
             'status' => $status,
             'reference' => (string) ($intent['metadata']['reference_id'] ?? ''),
@@ -170,7 +171,7 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
             'currency' => (string) ($intent['currency'] ?? ''),
             'payment_intent' => $intent,
             'data' => $intent,
-        ];
+        ]);
     }
 
     public function verifyCallbackSignature(Request $request): bool
@@ -214,7 +215,7 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
      * transaction id as client_reference_id; setup-mode sessions (saving a card)
      * and every other event type are acknowledged and ignored.
      */
-    public function callbackReferences(Request $request): ?array
+    protected function checkoutCallbackReferences(Request $request): ?array
     {
         $type = (string) $request->input('type', '');
         $session = (array) $request->input('data.object', []);
@@ -227,6 +228,120 @@ class StripeGateway implements PaymentGatewayInterface, SupportsRecurringPayment
         }
 
         return ['transaction_id' => (string) $session['client_reference_id'], 'gateway_ref' => (string) $session['id']];
+    }
+
+    protected function verifyReversal(array $verification): array
+    {
+        if (($verification['status'] ?? null) !== 'paid') {
+            return $verification;
+        }
+        $intent = $verification['payment_intent'] ?? null;
+        $charge = is_array($intent) ? ($intent['latest_charge'] ?? null) : null;
+        if (is_string($charge) && preg_match('/^ch_[A-Za-z0-9]+$/', $charge)) {
+            $response = $this->http()->get("{$this->baseUrl}/charges/{$charge}");
+            if (! $response->successful()) {
+                throw new RuntimeException('Stripe charge verification unavailable.');
+            }
+            $charge = $response->json();
+        }
+        if (! is_array($charge)) {
+            return array_replace($verification, ['success' => false, 'status' => 'reversal_review', 'review_reason' => 'missing-charge-state']);
+        }
+        $intentId = $intent['id'] ?? null;
+        if (! $intentId || ($charge['payment_intent'] ?? null) !== $intentId
+            || ($charge['currency'] ?? null) !== ($verification['currency'] ?? null)
+            || (int) ($charge['amount'] ?? -1) !== (int) ($verification['amount_cents'] ?? -2)) {
+            throw new RuntimeException('Stripe charge does not match its payment intent.');
+        }
+        $refunded = $charge['amount_refunded'] ?? 0;
+        if (! is_int($refunded) || $refunded < 0 || $refunded > $charge['amount']) {
+            throw new RuntimeException('Invalid Stripe refunded amount.');
+        }
+        if ($refunded > 0) {
+            return array_replace($verification, [
+                'success' => false,
+                'status' => $refunded === $charge['amount'] ? 'refunded' : 'reversal_review',
+                'provider_status' => 'refund', 'amount_refunded_cents' => $refunded,
+                'review_reason' => $refunded === $charge['amount'] ? null : 'partial-refund',
+            ]);
+        }
+        if (($charge['disputed'] ?? false) === true) {
+            $response = $this->http()->get("{$this->baseUrl}/disputes", ['charge' => $charge['id'], 'limit' => 100]);
+            if (! $response->successful() || $response->json('has_more') === true) {
+                throw new RuntimeException('Stripe dispute verification unavailable.');
+            }
+            $disputes = $response->json('data');
+            if (! is_array($disputes) || count($disputes) !== 1 || ($disputes[0]['charge'] ?? null) !== $charge['id']) {
+                return array_replace($verification, ['success' => false, 'status' => 'reversal_review', 'review_reason' => 'ambiguous-dispute']);
+            }
+            $dispute = $disputes[0];
+            if (($dispute['status'] ?? null) === 'won') {
+                return $verification;
+            }
+            $lost = ($dispute['status'] ?? null) === 'lost'
+                && ($dispute['amount'] ?? null) === $charge['amount']
+                && ($dispute['currency'] ?? null) === $charge['currency'];
+
+            return array_replace($verification, [
+                'success' => false, 'status' => $lost ? 'chargeback' : 'reversal_review',
+                'provider_status' => 'dispute-'.($dispute['status'] ?? 'unknown'),
+                'review_reason' => $lost ? null : 'open-or-partial-dispute',
+            ]);
+        }
+
+        return $verification;
+    }
+
+    public function callbackReferences(Request $request): ?array
+    {
+        $refs = $this->checkoutCallbackReferences($request);
+        if ($refs !== null) {
+            return $refs;
+        }
+        $type = (string) $request->input('type', '');
+        if (! in_array($type, ['charge.refunded', 'refund.created', 'refund.updated', 'refund.failed',
+            'charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed',
+            'charge.dispute.funds_withdrawn', 'charge.dispute.funds_reinstated'], true)) {
+            return null;
+        }
+        $object = (array) $request->input('data.object', []);
+        $intent = $object['payment_intent'] ?? null;
+        if (! is_string($intent) || ! preg_match('/^pi_[A-Za-z0-9]+$/', $intent)) {
+            throw new RuntimeException('Stripe reversal lacks a resolvable payment intent.');
+        }
+        // Resolve identifiers with our API credentials; signed event data alone
+        // neither supplies the stored checkout id nor authorizes a reversal.
+        $response = $this->http()->get("{$this->baseUrl}/checkout/sessions", ['payment_intent' => $intent, 'limit' => 2]);
+        if (! $response->successful()) {
+            throw new RuntimeException('Stripe reversal checkout lookup unavailable.');
+        }
+        $sessions = $response->json('data');
+        if (! is_array($sessions) || $response->json('has_more') === true || count($sessions) > 1) {
+            throw new RuntimeException('Stripe reversal checkout lookup is ambiguous.');
+        }
+        if (count($sessions) === 1) {
+            $session = $sessions[0];
+            if (($session['mode'] ?? null) !== 'payment' || ($session['payment_intent'] ?? null) !== $intent
+                || ! is_string($session['id'] ?? null)) {
+                throw new RuntimeException('Stripe reversal checkout does not match its payment intent.');
+            }
+
+            $reference = (string) ($session['client_reference_id'] ?? '');
+            if (! ctype_digit($reference)) {
+                return null;
+            }
+
+            return ['transaction_id' => $reference, 'gateway_ref' => $session['id']];
+        }
+        $response = $this->http()->get("{$this->baseUrl}/payment_intents/{$intent}");
+        $reference = (string) $response->json('metadata.reference_id', '');
+        if (! $response->successful()) {
+            throw new RuntimeException('Stripe legacy payment lookup unavailable.');
+        }
+
+        return ctype_digit($reference)
+            ? ['transaction_id' => $reference, 'gateway_ref' => $intent]
+            : (preg_match('/^RENEW-\d+-\d{8}$/', $reference) ? ['transaction_id' => null, 'gateway_ref' => $intent] : null);
     }
 
     // ------------------------------------------------------ recurring (cards)

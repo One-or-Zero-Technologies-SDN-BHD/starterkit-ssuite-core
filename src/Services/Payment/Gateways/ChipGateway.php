@@ -9,6 +9,7 @@ use App\Support\Billing\Currency;
 use Carbon\Carbon;
 use Illuminate\Http\Client\Response;
 use Illuminate\Http\Request;
+use RuntimeException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -27,6 +28,8 @@ use Illuminate\Support\Facades\Log;
  */
 class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
 {
+    private ?array $refundEvent = null;
+
     protected $secretKey;
 
     protected $brandId;
@@ -82,15 +85,17 @@ class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
         if ($response->successful() && isset($data['status'])) {
             $status = self::outcome((string) $data['status']);
 
-            return [
+            return $this->verifyReversal($purchaseId, [
                 'success' => $status === 'paid',
                 'status' => $status,
+                'provider_status' => $data['status'],
+                'review_reason' => $data['status'] === 'pending_refund' ? 'refund-pending' : null,
                 // For PaymentVerification::matches(): whose payment, how much, in what.
                 'reference' => (string) ($data['reference'] ?? ''),
                 'amount_cents' => $data['purchase']['total'] ?? null,
                 'currency' => (string) ($data['purchase']['currency'] ?? ''),
                 'data' => $data,
-            ];
+            ]);
         }
 
         return [
@@ -109,10 +114,69 @@ class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
     {
         return match ($status) {
             'paid', 'cleared', 'settled' => 'paid',
-            'refunded', 'pending_refund', 'chargeback' => 'refunded',
+            'refunded', 'pending_refund', 'chargeback', 'charged_back', 'retrieved' => 'reversal_review',
             'error', 'cancelled', 'expired', 'blocked', 'overdue', 'released' => 'failed',
             default => 'pending',
         };
+    }
+
+    public function callbackReferences(Request $request): ?array
+    {
+        if ($request->input('event_type') !== 'payment.refunded') {
+            return $this->purchaseCallbackReferences($request);
+        }
+        $purchaseId = $request->input('related_to.type') === 'purchase' ? $request->input('related_to.id') : null;
+        if (! is_string($purchaseId) || ! preg_match('/^[A-Za-z0-9-]+$/', $purchaseId)) {
+            throw new RuntimeException('CHIP refund lacks a purchase reference.');
+        }
+        $response = $this->http()->get("{$this->baseUrl}/purchases/{$purchaseId}/");
+        if (! $response->successful() || $response->json('id') !== $purchaseId) {
+            throw new RuntimeException('CHIP refund purchase lookup unavailable.');
+        }
+        $reference = (string) $response->json('reference', '');
+        if (! ctype_digit($reference) && ! preg_match('/^RENEW-\d+-\d{8}$/', $reference)) {
+            return null;
+        }
+        $this->refundEvent = [
+            'purchase_id' => $purchaseId,
+            'payment_id' => $request->input('id'),
+            'amount' => $request->input('payment.amount'),
+            'currency' => $request->input('payment.currency'),
+            'is_outgoing' => $request->input('payment.is_outgoing'),
+            'payment_type' => $request->input('payment.payment_type'),
+        ];
+
+        return ['transaction_id' => ctype_digit($reference) ? $reference : null, 'gateway_ref' => $purchaseId];
+    }
+
+    protected function verifyReversal(string $purchaseId, array $verification): array
+    {
+        $providerStatus = $verification['data']['status'] ?? null;
+        if (! in_array($providerStatus, ['refunded', 'pending_refund', 'chargeback', 'charged_back', 'retrieved'], true)
+            && $this->refundEvent === null) {
+            return $verification;
+        }
+        // CHIP explicitly defines refunded as FULL OR PARTIAL. Only a signed
+        // completed refund Payment for the entire verified purchase is terminal.
+        // refundable_amount==0 is not sufficient (a method may forbid refunds).
+        $event = $this->refundEvent;
+        $full = $providerStatus === 'refunded' && $event !== null
+            && $event['purchase_id'] === $purchaseId && is_string($event['payment_id']) && $event['payment_id'] !== ''
+            && $event['is_outgoing'] === true && $event['payment_type'] === 'refund'
+            && is_int($event['amount']) && $event['amount'] > 0
+            && $event['amount'] === ($verification['amount_cents'] ?? null)
+            && strtoupper((string) $event['currency']) === strtoupper((string) ($verification['currency'] ?? ''));
+
+        return array_replace($verification, [
+            'success' => false, 'status' => $full ? 'refunded' : 'reversal_review',
+            'provider_status' => $providerStatus,
+            'amount_refunded_cents' => $event['amount'] ?? null,
+            'review_reason' => $full ? null : match ($providerStatus) {
+                'pending_refund' => 'refund-pending',
+                'chargeback', 'charged_back', 'retrieved' => 'dispute-requires-review',
+                default => 'partial-or-unproven-refund-total',
+            },
+        ]);
     }
 
     /**
@@ -317,7 +381,7 @@ class ChipGateway implements PaymentGatewayInterface, SupportsRecurringPayments
      * transaction id in `reference`; anything else (renewal RENEW-… and
      * card-verification CARD-… purchases, which set no callback) is not ours.
      */
-    public function callbackReferences(Request $request): ?array
+    protected function purchaseCallbackReferences(Request $request): ?array
     {
         $reference = (string) $request->input('reference', '');
         $purchaseId = $request->input('id');
