@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Consolidate pending Stripe and CHIP refund/dispute verification in the shared source. Full refunds require verified evidence; partial, pending and ambiguous reversals stay in review.
+- Use `main` as the development/default branch while retaining existing release tags and consumer locks.
+
 ## 0.5.3 — 2026-11-20
 
 - Count legacy coupon redemptions without a payment link in the locked once-per-user check. A nullable historical link cannot authorize a second discounted plan grant.

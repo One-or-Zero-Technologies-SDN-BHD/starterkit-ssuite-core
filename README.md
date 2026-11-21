@@ -72,3 +72,10 @@ The Composer package is `ssuite/core`, hosted in `One-or-Zero-Technologies-SDN-B
 `Support\Billing\PaymentInstruments` is the shared removal path for ordinary card removal and ownership transfers. App transfer callbacks call `ownershipChanged($tenant, $outgoingId, $incomingId)` under the existing workspace lock, before publishing ownership. Local consent is revoked first, subscription renewal links are disabled/detached, and gateway cleanup plus email notification to both owners follows the actual app commit. Gateway cleanup is best effort; local consent stays revoked if it fails. The renewal service uses the same workspace lock and checks the instrument's current owner before charging.
 
 These changes are released in **0.5.3** and need app-owned controller hooks. Consumer lockfiles and local core-source edits are separate. SCount's independent activation service also needs the coupon-grant changes; merely updating its package is insufficient. The template's `docs/BILLING-COUPON-OWNERSHIP-FIXES-2026-11-20.md` lists pickup paths and regression coverage. Consumer rollout receipts are recorded in [the template report](https://github.com/One-or-Zero-Technologies-SDN-BHD/starterkit-laravel-livewire/blob/main/docs/BILLING-SECURITY-ROLLOUT-2026-11-20.md). No production deployment or live-provider acceptance is claimed here.
+
+
+## Development branch and pending provider guards
+
+`main` is the active development branch. The latest existing release tag remains **v0.5.3**; branch cleanup does not retag or publish a new package version, update consumer lockfiles, or deploy apps.
+
+Development source verifies current Stripe charge/refund/dispute state and CHIP signed full-refund evidence before classifying a reversal. Partial, pending and unproven reversals remain in review. Existing app compatibility adapters remain in place until a coordinated package release.
